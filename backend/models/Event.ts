@@ -24,15 +24,27 @@ export default model('Event', eventSchema);
 // ---------- validation (Joi) ----------
 export const EVENT_TYPES = ['EMAIL_SENT', 'EMAIL_DELIVERED', 'EMAIL_OPENED', 'EMAIL_CLICKED', 'EMAIL_BOUNCED', 'EMAIL_UNSUBSCRIBED'];
 
+// a UTC time written like 2026-09-01T10:00:00Z (milliseconds allowed). The brief says every good timestamp is UTC
+const UTC_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+
+// turn the text into a Date and back into text. If it changed, the day does not exist
+// (2026-02-30 comes back as 2026-03-02), so the row is rejected instead of moved to another day
+const utcDate = (code: string) =>
+  Joi.string().pattern(UTC_ISO).custom((text, helpers) => {
+    const date = new Date(text);
+    const sameBack = !isNaN(date.getTime()) && date.toISOString().slice(0, 19) === text.slice(0, 19);
+    return sameBack ? date : helpers.error('any.invalid');
+  }).required().error(new Error(code));
+
 // one rule per field, and the reason code to return if that rule fails
 const eventJoi = Joi.object({
   event_id:        Joi.string().pattern(/\S/).required().error(new Error('MISSING_EVENT_ID')),
   customer_id:     Joi.string().pattern(/\S/).required().error(new Error('MISSING_CUSTOMER_ID')),
   dealer_id:       Joi.string().pattern(/\S/).required().error(new Error('MISSING_DEALER_ID')),
   event_type:      Joi.string().valid(...EVENT_TYPES).required().error(new Error('UNKNOWN_EVENT_TYPE')),
-  event_timestamp: Joi.date().iso().required().error(new Error('INVALID_EVENT_TIMESTAMP')),
-  received_at:     Joi.date().iso().required().error(new Error('INVALID_RECEIVED_AT')),
-  lead_created_at: Joi.date().iso().required().error(new Error('INVALID_LEAD_CREATED_AT')),
+  event_timestamp: utcDate('INVALID_EVENT_TIMESTAMP'),
+  received_at:     utcDate('INVALID_RECEIVED_AT'),
+  lead_created_at: utcDate('INVALID_LEAD_CREATED_AT'),
   // these 4 are only saved: text, "" or null is fine, and the key may be missing
   campaign_id:     Joi.string().allow('', null).error(new Error('INVALID_CAMPAIGN_ID')),
   segment:         Joi.string().allow('', null).error(new Error('INVALID_SEGMENT')),
