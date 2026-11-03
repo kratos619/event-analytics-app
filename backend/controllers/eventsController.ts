@@ -3,6 +3,7 @@ import Event,{EVENT_TYPES} from '../models/Event';
 import Joi from 'joi';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
+import * as eventsService from '../services/eventsService';
 
 
 
@@ -45,15 +46,7 @@ const getByType = async (req: Request, res: Response) => {
         const { match, error } = buildMatch(req.query);
         if (error) return res.status(400).send({ error: 'Bad Request', message: error });
 
-        const rows = await Event.aggregate([
-            { $match: match },            
-            { $group: { _id: '$event_type', count: { $sum: 1 } } },   // like: SELECT event_type, COUNT(*) ... GROUP BY event_type
-            { $sort: { _id: 1 } },
-        ]);
-        const by_type = rows.map((r) => ({ event_type: r._id, count: r.count }));
-        const total = by_type.reduce((sum, r) => sum + r.count, 0);
-
-        return res.status(200).send({ total, by_type });
+        return res.status(200).send(await eventsService.getByType(match));
     } catch (e: any) {
         return res.status(500).send({ error: 'Query failed', message: e.message });
     }
@@ -105,9 +98,9 @@ const getLate = async (req: Request, res: Response) => {
             { $match: match },
             {
                 $group: {
-                    _id: null,
-                    total: { $sum: 1 },
-                    late: { $sum: { $cond: [{ $gt: [delay, LATE_HOURS * 3600 * 1000] }, 1, 0] } },
+                    _id: null, //one group for all rows, so we get one row back with the totals
+                    total: { $sum: 1 }, //counts every event.
+                    late: { $sum: { $cond: [{ $gt: [delay, LATE_HOURS * 3600 * 1000] }, 1, 0] } },//counts only the events that are late eg. delay > 24 hours
                     avg_delay_ms: { $avg: delay },
                 }
             },
@@ -145,6 +138,7 @@ const getRejected = async (req: Request, res: Response) => {
         if (error) return res.status(400).send({ error: 'Bad Request', message: error.message });
 
         const filter = value.reason ? { reason: value.reason } : {};
+        console.log({ filter })
         const [total, records] = await Promise.all([
             RejectedRecord.countDocuments(filter),
             RejectedRecord.find(filter).sort({ row_number: 1 }).skip((value.page - 1) * value.limit).limit(value.limit)
