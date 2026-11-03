@@ -343,3 +343,30 @@ Where I stepped in:
 - It added its own name as co-author on my commits, and the e-mail it set up for them was linked on
   GitHub to a different account. I removed that line and rewrote the commits with my own GitHub no-reply
   address.
+
+## What is not great
+
+- **Two imports at the same moment.** The unique index stops duplicates, but one of the two fails with a
+  duplicate key error and has to be run again. The import is safe to restart, it is not atomic.
+- **`rejectedrecords` keeps only the latest import.** Counts per import are kept in `importruns`, the
+  rejected rows themselves are not.
+- **The import reads the whole file into memory**, so memory grows with the file (see Performance).
+- **Pagination uses `skip`**, which gets slow on very deep pages.
+- **Timestamps are strict.** Only UTC times ending in `Z` are accepted, so a valid ISO time with an offset
+  such as `+05:30` is rejected. The brief says every good timestamp is UTC.
+- **Frontend.** No automated UI tests, I checked it by hand. Filter inputs have no labels, only a `title`.
+  Most types are `any`.
+- No authentication, as the brief says it is out of scope.
+
+## What I want to improve next
+
+I am sending this version first to stay inside the time box. I would change these next, in this order:
+
+1. Stream and batch the import, with ids looked up per chunk, to remove the memory growth.
+2. Make concurrent imports safe (upsert-based writes or a lock), and tag each rejected row with the import
+   it came from so `rejectedrecords` keeps history.
+3. Return the dashboard metrics from one aggregation, or pre-computed daily totals if the data grows a lot.
+4. Cursor pagination instead of `skip`.
+5. Frontend: labels, proper types, a few UI tests.
+
+
