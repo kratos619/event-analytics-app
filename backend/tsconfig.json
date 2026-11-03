@@ -9,5 +9,10 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["server.ts", "controller", "model", "router"]
+"include": [
+  "server.ts",
+  "controllers",
+  "models",
+  "routes"
+]
 }
