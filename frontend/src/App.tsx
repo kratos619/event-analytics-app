@@ -6,6 +6,8 @@ import TypeBars from './components/TypeBars'
 import DealerTable from './components/DealerTable'
 import Filters from './components/Filters'
 import ImportButton from './components/ImportButton'
+import EventsTable from './components/EventsTable'
+import QualityPanel from './components/QualityPanel'
 
 const App = () => {
   const [filters, setFilters] = useState(emptyFilters)
@@ -51,6 +53,8 @@ const App = () => {
     loadOptions()
   }, [refresh])
 
+  const filtersOn = Object.values(filters).some(Boolean)       // is any filter set?
+
   const apply = (newFilters: FilterValues) => {
     setLoading(true)
     setFilters(newFilters)
@@ -71,7 +75,11 @@ const App = () => {
       {loading && <div className="spinner-border" role="status" />}
       {error && <div className="alert alert-danger">Could not load the data: {error}</div>}
       {!loading && metrics && metrics.late.total === 0 && (
-        <div className="alert alert-info">No events found. Import the file first, or loosen the filters.</div>
+        <div className="alert alert-info">
+          {filtersOn
+            ? 'No events match these filters. Try a wider date range, or press Reset.'
+            : 'No events yet. Click "Import events file" to load them.'}
+        </div>
       )}
       {!loading && metrics && metrics.late.total > 0 && (
         <>
@@ -81,8 +89,11 @@ const App = () => {
             <div className="col-lg-6"><TypeBars byType={metrics.byType.by_type} total={metrics.byType.total} /></div>
             <div className="col-lg-6"><DealerTable byDealer={metrics.byDealer.by_dealer} /></div>
           </div>
+          <EventsTable key={JSON.stringify(filters)} filters={filters} refresh={refresh} />
         </>
       )}
+
+      <QualityPanel refresh={refresh} />
     </div>
   )
 }
