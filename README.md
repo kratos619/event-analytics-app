@@ -310,32 +310,6 @@ grows with the file, and that is the first thing that would break on a much bigg
   TypeScript types say nothing about what is in a JSON file. Query strings are validated and unknown
   parameters are rejected. There are no secrets in the code, only defaults and environment variables.
 
-## What is not great
-
-- **Two imports at the same moment.** The unique index stops duplicates, but one of the two fails with a
-  duplicate key error and has to be run again. The import is safe to restart, it is not atomic.
-- **`rejectedrecords` keeps only the latest import.** Counts per import are kept in `importruns`, the
-  rejected rows themselves are not.
-- **Pagination uses `skip`**, which gets slow on very deep pages.
-- **Frontend.** There are no automated UI tests, I checked it by hand. Filter inputs have no labels, only a
-  `title`. Most frontend types are `any`.
-- No authentication, as the brief says it is out of scope.
-
-## What I want to improve next
-
-I am sending this version first to stay inside the time box. These are the changes I would make next,
-roughly in this order, because each one takes more time than I had.
-
-1. **Stream and batch the import** (read the file in chunks, look up ids per chunk). This removes the
-   memory growth and is the real fix for bigger files.
-2. **Make concurrent imports safe.** Upsert-based writes or a lock, and tag every rejected row with the
-   import it came from so `rejectedrecords` keeps history instead of the latest import only.
-3. **Metrics in one request.** One aggregation for the whole dashboard instead of four requests (they run
-   in parallel now, but it is still four queries). For a lot more data, pre-computed daily totals.
-4. **Cursor pagination** instead of `skip`.
-5. **Frontend clean-up.** Add labels, proper types, a few UI tests, and an integrity hash on the
-   Bootstrap link.
-
 ## AI development note
 
 I used Claude Code (Claude Sonnet 5.5) as a pair programmer, in the terminal and in VS Code. For a last
