@@ -50,4 +50,68 @@ const getByType = async (req: Request, res: Response) => {
     }
 };
 
-export { getByType };
+const getDaily = async (req: Request, res: Response) => {
+    try {
+        const { match, error } = buildMatch(req.query);
+        if (error) return res.status(400).send({ error: 'Bad Request', message: error });
+
+        const rows = await Event.aggregate([
+            { $match: match },
+            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$event_timestamp', timezone: 'UTC' } }, count: { $sum: 1 } } },
+            { $sort: { _id: 1 } },
+        ]);
+        return res.status(200).send({ daily: rows.map((r) => ({ day: r._id, count: r.count })) });
+    } catch (e: any) {
+        return res.status(500).send({ error: 'Query failed', message: e.message });
+    }
+};
+
+// events per dealer, biggest first
+const getByDealer = async (req: Request, res: Response) => {
+    try {
+        const { match, error } = buildMatch(req.query);
+        if (error) return res.status(400).send({ error: 'Bad Request', message: error });
+
+        const rows = await Event.aggregate([
+            { $match: match },
+            { $group: { _id: '$dealer_id', count: { $sum: 1 } } },
+            { $sort: { count: -1, _id: 1 } },
+        ]);
+        return res.status(200).send({ by_dealer: rows.map((r) => ({ dealer_id: r._id, count: r.count })) });
+    } catch (e: any) {
+        return res.status(500).send({ error: 'Query failed', message: e.message });
+    }
+};
+
+const LATE_HOURS = 24;
+
+// how many events arrived late, and the average delay between event time and received time
+const getLate = async (req: Request, res: Response) => {
+    try {
+        const { match, error } = buildMatch(req.query);
+        if (error) return res.status(400).send({ error: 'Bad Request', message: error });
+
+        const delay = { $subtract: ['$received_at', '$event_timestamp'] };   // milliseconds
+        const [row] = await Event.aggregate([
+            { $match: match },
+            {
+                $group: {
+                    _id: null,
+                    total: { $sum: 1 },
+                    late: { $sum: { $cond: [{ $gt: [delay, LATE_HOURS * 3600 * 1000] }, 1, 0] } },
+                    avg_delay_ms: { $avg: delay },
+                }
+            },
+        ]);
+        return res.status(200).send({
+            total: row?.total ?? 0,
+            late: row?.late ?? 0,
+            late_after_hours: LATE_HOURS,
+            avg_delay_minutes: row ? Math.round(row.avg_delay_ms / 60000) : 0,
+        });
+    } catch (e: any) {
+        return res.status(500).send({ error: 'Query failed', message: e.message });
+    }
+};
+
+export { getByType, getDaily, getByDealer, getLate };
