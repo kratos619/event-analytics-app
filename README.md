@@ -212,7 +212,9 @@ one line chart. The bars for event types are plain Bootstrap progress bars. All 
 refresh counter, the loaded metrics) lives in `App.tsx` and goes down as props. The filter form keeps a
 draft and only sends it when you press Apply, so typing never fires a request. Every `fetch` goes through
 `src/api/client.ts`. The page has loading, empty and error states, and the quality panel and the
-filters stay visible when there is no data.
+filters stay visible when there is no data. The four metric requests run at the same time. While new
+numbers load, the old ones stay on screen, dimmed, and an answer for filters that have changed since is
+ignored, so one dealer's numbers never show under another dealer's name.
 
 ## Assumptions
 
@@ -227,8 +229,10 @@ Where the brief left something open, this is what I assumed.
   with the same id is accepted.
 - An id, customer or dealer made only of spaces counts as missing. Event types are case sensitive, so
   `email_sent` is unknown.
-- Timestamps must be ISO-8601. An offset such as `+05:30` is converted to UTC and a date without a time
-  means midnight UTC. A timestamp with no timezone at all is read in the server's timezone (see the limits).
+- Timestamps must be UTC ISO-8601 ending in `Z`, like `2026-09-01T10:00:00Z` (milliseconds allowed), because
+  the brief says every well-formed timestamp is UTC. An offset such as `+05:30`, a date without a time and a
+  time without a timezone are rejected. So is a day that does not exist, like `2026-02-30`, instead of being
+  moved to 2 March.
 - `lead_created_at` equal to `event_timestamp` is fine, only a later one is rejected. A `received_at` that is
   earlier than the event time is not treated as an error, because the brief does not call it one.
 - `campaign_id`, `segment`, `email_provider` and `lead_status` may be empty, `null` or missing. A value that
@@ -312,13 +316,9 @@ grows with the file, and that is the first thing that would break on a much bigg
   duplicate key error and has to be run again. The import is safe to restart, it is not atomic.
 - **`rejectedrecords` keeps only the latest import.** Counts per import are kept in `importruns`, the
   rejected rows themselves are not.
-- **A timestamp without a timezone** would be read in the server's timezone. Every timestamp in the
-  supplied file ends in `Z`, and the tests run with `TZ=UTC`, but the dev and start scripts do not pin it.
 - **Pagination uses `skip`**, which gets slow on very deep pages.
 - **Frontend.** There are no automated UI tests, I checked it by hand. Filter inputs have no labels, only a
-  `title`. A slow response for old filters is not cancelled, so quick repeated clicks on Apply could show
-  an older answer. Pressing Apply or Reset when nothing has changed leaves the page loading (the filters
-  object is the same object, so React does nothing). Most frontend types are `any`.
+  `title`. Most frontend types are `any`.
 - No authentication, as the brief says it is out of scope.
 
 ## What I want to improve next
@@ -330,17 +330,16 @@ roughly in this order, because each one takes more time than I had.
    memory growth and is the real fix for bigger files.
 2. **Make concurrent imports safe.** Upsert-based writes or a lock, and tag every rejected row with the
    import it came from so `rejectedrecords` keeps history instead of the latest import only.
-3. **Metrics in one request.** One aggregation for the whole dashboard instead of four requests that
-   run one after another, and cancel stale requests in the frontend. For a lot more data, pre-computed
-   daily totals.
+3. **Metrics in one request.** One aggregation for the whole dashboard instead of four requests (they run
+   in parallel now, but it is still four queries). For a lot more data, pre-computed daily totals.
 4. **Cursor pagination** instead of `skip`.
-5. **Reject a timestamp that has no timezone** instead of guessing, and pin `TZ=UTC` for the server.
-6. **Frontend clean-up.** Fix the Apply/Reset case, add labels, proper types, a few UI tests, and an
-   integrity hash on the Bootstrap link.
+5. **Frontend clean-up.** Add labels, proper types, a few UI tests, and an integrity hash on the
+   Bootstrap link.
 
 ## AI development note
 
-I used Claude Code (Claude Sonnet 5.5) as a pair programmer, in the terminal and in VS Code.
+I used Claude Code (Claude Sonnet 5.5) as a pair programmer, in the terminal and in VS Code. For a last
+review of the finished project I used Claude (Opus 5.5) in the Claude app.
 
 What it did: most of the code started as suggestions from Claude in chat (the validation, the import,
 the metric queries, the React components and the tests). I typed or approved every file, ran it, and
@@ -350,9 +349,7 @@ What I checked: I ran `npm test` (six tests). The numbers from the API were comp
 directly from the JSON file by a separate script (9,000, 300, 100, 600, the per-dealer and per-day counts
 and the 493 late events). I opened the dashboard and used the filters and the Import button, looked at
 the empty state, and saw the error state when the backend was off. Two of the tests were also run against
-code that had been broken on purpose to see them fail. A check with a non-UTC time zone showed that
-`Joi.date().iso()` accepts a timestamp with no timezone and reads it as local time, which is why that
-limit is written down above.
+code that had been broken on purpose to see them fail.
 
 Where I stepped in:
 
@@ -361,7 +358,14 @@ Where I stepped in:
 - It started with a service layer and several extra controller files. I removed them and kept plain
   routes, controllers and models.
 - Its first frontend API file used generics and `Promise.all`. I asked for the plain style I use in my
-  own React projects (`fetch`, check `ok`, return the JSON), and it was rewritten that way.
+  own React projects (`fetch`, check `ok`, return the JSON), and it was rewritten that way. Later I put
+  `Promise.all` back in `App.tsx`, because loading the four metrics one after another was slower.
+- In that last review, `Joi.date().iso()` turned out to accept `2026-02-30` (saved as 2 March) and to read
+  a time without `Z` in the server's timezone. I changed the rule to accept only UTC times ending in `Z`
+  that turn back into the same text.
+- The same review found that pressing Apply with nothing changed left the spinner on for good, and that a
+  slow answer for an old dealer filter could replace the numbers of the new one. The spinner now turns on
+  only when data really loads, and an old answer is ignored.
 - It added its own name as co-author on my commits, and the e-mail it set up for them was linked on
   GitHub to a different account. I removed that line and rewrote the commits with my own GitHub no-reply
   address.

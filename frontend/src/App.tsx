@@ -19,23 +19,30 @@ const App = () => {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    let stale = false                                            // becomes true if the filters change before this answer arrives
     async function loadMetrics() {
+      setLoading(true)                                           // spinner on only when we really load
       try {
         const query = filterQuery(filters)
-        const late = await apiGet(`/api/metrics/late${query}`)
-        const byDealer = await apiGet(`/api/metrics/by-dealer${query}`)
-        const byType = await apiGet(`/api/metrics/by-type${query}`)
-        const daily = await apiGet(`/api/metrics/daily${query}`)
+        const [late, byDealer, byType, daily] = await Promise.all([   // the 4 requests run at the same time
+          apiGet(`/api/metrics/late${query}`),
+          apiGet(`/api/metrics/by-dealer${query}`),
+          apiGet(`/api/metrics/by-type${query}`),
+          apiGet(`/api/metrics/daily${query}`),
+        ])
+        if (stale) return                                        // an older request: ignore its answer
         setMetrics({ late, byDealer, byType, daily })
         setError('')
       } catch (e: any) {
+        if (stale) return
         setError(e.message)
         setMetrics(null)                                         // do not keep showing the old numbers under the error
       } finally {
-        setLoading(false)
+        if (!stale) setLoading(false)
       }
     }
     loadMetrics()
+    return () => { stale = true }                                // React runs this when the filters change again
   }, [filters, refresh])
 
   // the dropdown options come from the unfiltered numbers, so they do not shrink when a filter is applied
@@ -55,34 +62,30 @@ const App = () => {
 
   const filtersOn = Object.values(filters).some(Boolean)       // is any filter set?
 
-  const apply = (newFilters: FilterValues) => {
-    setLoading(true)
-    setFilters(newFilters)
-  }
-
-  const importDone = () => {
-    setLoading(true)
-    setRefresh(refresh + 1)
-  }
+  const apply = (newFilters: FilterValues) => setFilters(newFilters)   // the effect above turns the spinner on
+  const importDone = () => setRefresh(refresh + 1)
 
   return (
     <div className="container py-4">
-      <h1 className="h3 mb-4">Event Analytics</h1>
+      <h1 className="h3 mb-4">
+        Event Analytics
+        {loading && metrics && <span className="spinner-border spinner-border-sm ms-2 align-middle" role="status" />}
+      </h1>
 
       <ImportButton onDone={importDone} />
       <Filters filters={filters} dealers={dealers} eventTypes={eventTypes} onApply={apply} />
 
-      {loading && <div className="spinner-border" role="status" />}
+      {loading && !metrics && <div className="spinner-border" role="status" />}{/* first load: big spinner */}
       {error && <div className="alert alert-danger">Could not load the data: {error}</div>}
-      {!loading && metrics && metrics.late.total === 0 && (
+      {metrics && metrics.late.total === 0 && (
         <div className="alert alert-info">
           {filtersOn
             ? 'No events match these filters. Try a wider date range, or press Reset.'
             : 'No events yet. Click "Import events file" to load them.'}
         </div>
       )}
-      {!loading && metrics && metrics.late.total > 0 && (
-        <>
+      {metrics && metrics.late.total > 0 && (
+        <div style={{ opacity: loading ? 0.5 : 1 }}>{/* old numbers stay, dimmed, until the new ones arrive */}
           <SummaryCards late={metrics.late} dealers={metrics.byDealer.by_dealer.length} />
           <DailyChart daily={metrics.daily.daily} />
           <div className="row g-3 mb-4">
@@ -90,7 +93,7 @@ const App = () => {
             <div className="col-lg-6"><DealerTable byDealer={metrics.byDealer.by_dealer} /></div>
           </div>
           <EventsTable key={JSON.stringify(filters)} filters={filters} refresh={refresh} />
-        </>
+        </div>
       )}
 
       <QualityPanel refresh={refresh} />
