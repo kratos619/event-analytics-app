@@ -1,13 +1,18 @@
 import { useEffect, useState } from 'react'
-import { apiGet, filterQuery } from './api/client'
+import { apiGet, emptyFilters, filterQuery, type Filters as FilterValues } from './api/client'
 import SummaryCards from './components/SummaryCards'
 import DailyChart from './components/DailyChart'
 import TypeBars from './components/TypeBars'
 import DealerTable from './components/DealerTable'
+import Filters from './components/Filters'
+import ImportButton from './components/ImportButton'
 
 const App = () => {
-  const [filters] = useState({ dealer_id: '', event_type: '', from: '', to: '' })   // the filter controls come in a later step
+  const [filters, setFilters] = useState(emptyFilters)
+  const [refresh, setRefresh] = useState(0)                      // goes up after an import, to load the data again
   const [metrics, setMetrics] = useState<any>(null)
+  const [dealers, setDealers] = useState<string[]>([])           // options for the filter dropdowns
+  const [eventTypes, setEventTypes] = useState<string[]>([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
 
@@ -23,23 +28,52 @@ const App = () => {
         setError('')
       } catch (e: any) {
         setError(e.message)
+        setMetrics(null)                                         // do not keep showing the old numbers under the error
       } finally {
         setLoading(false)
       }
     }
     loadMetrics()
-  }, [filters])
+  }, [filters, refresh])
+
+  // the dropdown options come from the unfiltered numbers, so they do not shrink when a filter is applied
+  useEffect(() => {
+    async function loadOptions() {
+      try {
+        const byDealer = await apiGet('/api/metrics/by-dealer')
+        const byType = await apiGet('/api/metrics/by-type')
+        setDealers(byDealer.by_dealer.map((d: any) => d.dealer_id).sort())
+        setEventTypes(byType.by_type.map((t: any) => t.event_type))
+      } catch {
+        // the page itself shows the error, the dropdowns just stay empty
+      }
+    }
+    loadOptions()
+  }, [refresh])
+
+  const apply = (newFilters: FilterValues) => {
+    setLoading(true)
+    setFilters(newFilters)
+  }
+
+  const importDone = () => {
+    setLoading(true)
+    setRefresh(refresh + 1)
+  }
 
   return (
     <div className="container py-4">
       <h1 className="h3 mb-4">Event Analytics</h1>
 
+      <ImportButton onDone={importDone} />
+      <Filters filters={filters} dealers={dealers} eventTypes={eventTypes} onApply={apply} />
+
       {loading && <div className="spinner-border" role="status" />}
       {error && <div className="alert alert-danger">Could not load the data: {error}</div>}
-      {metrics && metrics.late.total === 0 && (
+      {!loading && metrics && metrics.late.total === 0 && (
         <div className="alert alert-info">No events found. Import the file first, or loosen the filters.</div>
       )}
-      {metrics && metrics.late.total > 0 && (
+      {!loading && metrics && metrics.late.total > 0 && (
         <>
           <SummaryCards late={metrics.late} dealers={metrics.byDealer.by_dealer.length} />
           <DailyChart daily={metrics.daily.daily} />
