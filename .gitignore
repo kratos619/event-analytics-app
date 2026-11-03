@@ -1,0 +1,23 @@
+# dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+build/
+coverage/
+*.tsbuildinfo
+
+# secrets and local config
+.env
+.env.*
+!.env.example
+
+# logs and caches
+*.log
+npm-debug.log*
+.eslintcache
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
+backend/package-lock.json
