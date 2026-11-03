@@ -1,7 +1,16 @@
 import { Request, Response } from 'express';
 import Event,{EVENT_TYPES} from '../models/Event';
 import Joi from 'joi';
+import RejectedRecord from '../models/RejectedRecord';
+import ImportRun from '../models/ImportRun';
 
+
+
+
+const pageData = Joi.object({
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20),
+});
 
 
 // a day written like 2026-09-01 (UTC)
@@ -114,4 +123,61 @@ const getLate = async (req: Request, res: Response) => {
     }
 };
 
-export { getByType, getDaily, getByDealer, getLate };
+
+
+const getQuality = async (req: Request, res: Response) => {
+    try {
+        const [last_import, rows] = await Promise.all([
+            ImportRun.findOne().sort({ createdAt: -1 }).select('-_id -__v').lean(),
+            RejectedRecord.aggregate([{ $group: { _id: '$reason', count: { $sum: 1 } } }, { $sort: { count: -1, _id: 1 } }]),
+        ]);
+        return res.status(200).send({ last_import, by_reason: rows.map((r) => ({ reason: r._id, count: r.count })) });
+    } catch (e: any) {
+        return res.status(500).send({ error: 'Query failed', message: e.message });
+    }
+};
+
+
+// the rows we did not save, with the reason and the original row. ?reason=... narrows it down
+const getRejected = async (req: Request, res: Response) => {
+    try {
+        const { error, value } = pageData.keys({ reason: Joi.string() }).validate(req.query);
+        if (error) return res.status(400).send({ error: 'Bad Request', message: error.message });
+
+        const filter = value.reason ? { reason: value.reason } : {};
+        const [total, records] = await Promise.all([
+            RejectedRecord.countDocuments(filter),
+            RejectedRecord.find(filter).sort({ row_number: 1 }).skip((value.page - 1) * value.limit).limit(value.limit)
+                .select('-_id row_number reason raw').lean(),
+        ]);
+        return res.status(200).send({ page: value.page, limit: value.limit, total, records });
+    } catch (e: any) {
+        return res.status(500).send({ error: 'Query failed', message: e.message });
+    }
+};
+
+
+// accepted events, newest first, with the same filters as the metrics
+const getEvents = async (req: Request, res: Response) => {
+    try {
+        const { page, limit, ...filters } = req.query;
+        const paging = pageData.validate({ page, limit });
+        if (paging.error) return res.status(400).send({ error: 'Bad Request', message: paging.error.message });
+        const { match, error } = buildMatch(filters);
+        if (error) return res.status(400).send({ error: 'Bad Request', message: error });
+
+        const { page: p, limit: l } = paging.value;
+        const [total, events] = await Promise.all([
+            Event.countDocuments(match),
+            Event.find(match).sort({ event_timestamp: -1, event_id: 1 }).skip((p - 1) * l).limit(l).select('-_id -__v').lean(),
+        ]);
+        return res.status(200).send({ page: p, limit: l, total, events });
+    } catch (e: any) {
+        return res.status(500).send({ error: 'Query failed', message: e.message });
+    }
+};
+
+
+
+
+export { getByType, getDaily, getByDealer, getLate, getQuality, getRejected, getEvents };
