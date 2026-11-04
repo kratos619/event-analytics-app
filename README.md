@@ -92,7 +92,7 @@ backend/
     importController.ts   POST /api/import
     eventsController.ts   metrics, quality and the events list
   services/               the logic and the queries, no Express in here
-    importService.ts      read an uploaded file from disk, validate, deduplicate, save, record the run
+    importService.ts      read an uploaded file from disk, then validate, deduplicate and save it in chunks, record the run
     eventsService.ts      the queries behind the metrics, quality and events endpoints
   middleware/             upload (saves the uploaded file to disk), validate (checks the URL query),
                           errorHandler (errors become responses)
@@ -161,8 +161,8 @@ conflicting duplicate: the first event stays and the later row is saved in `reje
 reason `CONFLICTING_DUPLICATE`. An invalid row never claims an id, because validation runs first.
 
 **Importing the same file twice.**
-Events already saved are loaded first (one query on the ids in the file), so every row of a second import
-is compared with what is stored. Nothing new is inserted and `events` does not change. The brief asks me
+Events already saved are loaded first (one query per chunk of 1,000 rows, on the ids of that chunk), so
+every row of a second import is compared with what is stored. Nothing new is inserted and `events` does not change. The brief asks me
 to say whether repeated rows are recorded again. My choice: every import gets its own `file_id`. It writes
 its own summary to `importruns`, and its rejected rows (exact duplicates included) are saved in
 `rejectedrecords` with the same `file_id`. Nothing is deleted, so a second import adds another 10,000
@@ -220,7 +220,9 @@ with `test` in it. There are five files:
   into the database.
 - `import-service.test.ts`: `importEvents` called directly with the path of a saved file. It covers the cases from the
   brief (a valid event, a missing id or bad timestamp, an exact and a conflicting duplicate, a second
-  import) plus `file_id`, failed imports and the real 10,000-row file.
+  import) plus `file_id`, failed imports and the real 10,000-row file. The file is imported in chunks of
+  1,000 rows, and there are tests that the result is the same for chunk sizes from 1 to 1000, that a repeat
+  in a later chunk is still a duplicate, and that row numbers stay file-wide.
 - `api.test.ts`: the endpoints over HTTP, the upload (the file is saved to disk with the content that was
   sent), the 400 on every filtered route, and the 500 paths. It uses its own upload folder (`UPLOAD_DIR`).
 
@@ -317,14 +319,19 @@ For one dealer and a week, MongoDB reads about 90 documents instead of all 9,000
 query still takes only a few milliseconds with or without the indexes, so the gain shows when the
 collection grows, not now.
 
-The import reads the whole file into memory, loads every id in one query and inserts in one call. Memory
-grows with the file, and that is the first thing that would break on a much bigger file.
+The import parses the whole file at once, but it looks up, checks and saves the rows in chunks of 1,000.
+A generator (`chunks` in `importService.ts`) hands the chunks out one at a time, so each id lookup, each
+duplicate map and each insert is the size of a chunk, not of the file. The parsed array itself is still in
+memory, so memory still grows with the file. Reading the file as a stream, so that it never exists in
+memory as a whole, is the next step for a much bigger file.
 
 ## Reliability, logs and input handling
 
 - **Atomic or resumable?** Neither. The import is not one transaction and it does not continue from where
-  it stopped. It is safe to restart: if it dies half way, run it again. Saved events are loaded first and
-  `event_id` is unique, so the second run cannot create duplicates.
+  it stopped. Each chunk of 1,000 rows is saved on its own, so if an import fails half way the earlier
+  chunks stay saved (their events carry the `file_id` of the failed run, which also shows the counts so
+  far). It is safe to restart: run it again. Saved events are loaded first and `event_id` is unique, so the
+  second run cannot create duplicates; the rows that were already saved are counted as exact duplicates.
 - **Failures.** An import that fails is saved in `importruns` with `status: failed` and the error message,
   the endpoint answers with HTTP 500 and the same message, and the error is printed to the console
   (`import failed: ...`). The server prints a line when it starts, and exits with a message if MongoDB is
@@ -374,9 +381,10 @@ Where I stepped in:
 - **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
   quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
   again adds its rows again.
-- **The import reads the whole file into memory** after it is saved, so memory grows with the file (see
-  Performance). An upload is limited to 50 MB, and the browser checks that before sending. Saving to disk
-  is what would let a streaming parser or a background job take over later.
+- **The import still parses the whole file in one piece** after it is saved (`JSON.parse`), so memory grows
+  with the file, although the checking and saving are done in chunks of 1,000 rows (see Performance). An
+  upload is limited to 50 MB, and the browser checks that before sending. Saving to disk is what would let
+  a streaming parser or a background job take over later.
 - **A file that is not valid JSON, or not an array, is a 400.** It is deleted again and is not saved as a
   failed run, so only imports that started and then failed show up as `failed` in `importruns`.
 - **Uploaded files are never deleted.** A file stays in `uploads/` exactly when a run with its `file_id`

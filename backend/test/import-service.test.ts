@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
-import { importEvents } from '../services/importService';
+import { importEvents, chunks } from '../services/importService';
 import * as eventsService from '../services/eventsService';
 import { base, ev, writeRows, useTestDb } from './helpers';
 
@@ -217,6 +217,103 @@ describe('when the import cannot finish', () => {
         assert.deepEqual({ status: runs[0].status, error: runs[0].error, file_id: runs[0].file_id, file_name: runs[0].file_name },
             { status: 'failed', error: 'disk full', file_id: id, file_name: 'events-test.json' });
         assert.equal(await Event.countDocuments(), 0);
+    });
+});
+
+describe('chunks (the generator that cuts the rows into pieces)', () => {
+    test('pieces of the given size; the last one may be shorter; start is the position of its first row', () => {
+        assert.deepEqual([...chunks([1, 2, 3, 4, 5], 2)], [{ start: 0, rows: [1, 2] }, { start: 2, rows: [3, 4] }, { start: 4, rows: [5] }]);
+    });
+
+    test('an exact multiple has no empty last piece', () => {
+        assert.deepEqual([...chunks([1, 2, 3, 4], 2)].map((c) => c.rows), [[1, 2], [3, 4]]);
+    });
+
+    test('a size bigger than the list gives one piece, and an empty list gives none', () => {
+        assert.deepEqual([...chunks([1, 2, 3], 1000)], [{ start: 0, rows: [1, 2, 3] }]);
+        assert.deepEqual([...chunks([], 5)], []);
+    });
+
+    test('a piece is cut only when it is asked for', () => {
+        const pieces = chunks([1, 2, 3, 4, 5], 2);
+        assert.deepEqual(pieces.next().value, { start: 0, rows: [1, 2] });
+        assert.deepEqual(pieces.next().value, { start: 2, rows: [3, 4] });
+        assert.equal(pieces.next().done, false);                          // one more is waiting
+        assert.equal(pieces.next().done, true);
+    });
+
+    test('a size below 1, or not a whole number, is refused (it would loop forever)', () => {
+        for (const size of [0, -1, 1.5, NaN]) assert.throws(() => chunks([1], size).next(), RangeError, String(size));
+    });
+});
+
+describe('processing in chunks', () => {
+    // every kind of row, in an order that puts the duplicates and the conflict in different chunks
+    const rows = [
+        base,                                                // 1 saved
+        ev({ event_id: '' }),                                // 2 invalid
+        ev({ event_id: 'e2' }),                              // 3 saved
+        ev({ received_at: '2026-09-01T18:00:00Z' }),         // 4 exact duplicate of row 1
+        'not an object',                                     // 5 invalid
+        ev({ event_id: 'e2', event_type: 'EMAIL_SENT' }),    // 6 conflict with row 3
+        ev({ event_id: 'e3' }),                              // 7 saved
+        ev({ event_id: 'e3' }),                              // 8 exact duplicate of row 7
+        ev({ event_id: 'e4', customer_id: null }),           // 9 invalid
+        ev({ event_id: 'e5' }),                              // 10 saved
+    ];
+    const wipe = () => Promise.all([Event.deleteMany({}), RejectedRecord.deleteMany({}), ImportRun.deleteMany({})]);
+    const snapshot = async () => ({
+        events: (await Event.find().sort({ event_id: 1 }).lean()).map((e) => e.event_id),
+        rejected: (await RejectedRecord.find().sort({ row_number: 1 }).lean()).map((r) => [r.row_number, r.reason]),
+    });
+
+    test('chunk sizes 1, 2, 3, 4, 7, 10 and 1000 all give the same counts, events and rejected rows', async () => {
+        const file = writeRows(rows);
+        const expected = {
+            counts: { total_rows: 10, accepted: 4, exact: 2, conflicting: 1, invalid: 3 },
+            events: ['e1', 'e2', 'e3', 'e5'],
+            rejected: [[2, 'MISSING_EVENT_ID'], [4, 'EXACT_DUPLICATE'], [5, 'INVALID_RECORD'], [6, 'CONFLICTING_DUPLICATE'], [8, 'EXACT_DUPLICATE'], [9, 'MISSING_CUSTOMER_ID']],
+        };
+        for (const size of [1000, 1, 2, 3, 4, 7, 10]) {                       // 10 rows: 1, 2, 5, 10 divide it; 3, 4, 7 leave a short last chunk
+            await wipe();
+            const out = await importEvents(file, 'events-test.json', randomUUID(), size);
+            assert.deepEqual({ counts: counts(out.result), ...(await snapshot()) }, expected, `chunk size ${size}`);
+        }
+    });
+
+    test('a repeat in a LATER chunk is a duplicate of the event an earlier chunk saved; the first copy stays', async () => {
+        const result = await importEvents(writeRows([base, ev({ event_type: 'EMAIL_CLICKED' }), base]), 'events-test.json', randomUUID(), 1);
+        assert.deepEqual(counts(result.result), { total_rows: 3, accepted: 1, exact: 1, conflicting: 1, invalid: 0 });
+        assert.equal((await Event.findOne({ event_id: 'e1' }).lean())!.event_type, 'EMAIL_OPENED');
+    });
+
+    test('row numbers are positions in the whole file, not in the chunk', async () => {
+        await importEvents(writeRows([base, ev({ event_id: 'e2' }), ev({ event_id: 'e3' }), ev({ event_id: 'e4' }), ev({ event_id: '' })]), 'events-test.json', randomUUID(), 2);
+        assert.deepEqual((await RejectedRecord.findOne().lean())!.row_number, 5);   // the third chunk has 1 row, and it is row 5
+    });
+
+    test('the chunks of one import share one file_id and one run', async () => {
+        const id = randomUUID();
+        await importEvents(writeRows(rows), 'events-test.json', id, 3);
+        assert.equal(await ImportRun.countDocuments(), 1);
+        assert.equal(await Event.countDocuments({ file_id: id }), 4);
+        assert.equal(await RejectedRecord.countDocuments({ file_id: id }), 6);
+    });
+
+    test('a failure in a later chunk: earlier chunks stay saved, and the failed run shows how far it got', async () => {
+        const log = mock.method(console, 'error', () => {});
+        const realInsert = Event.insertMany.bind(Event) as any;
+        let calls = 0;
+        const insert = mock.method(Event, 'insertMany', async (docs: any) => { if (++calls === 2) throw new Error('disk full'); return realInsert(docs); });
+        const id = randomUUID();
+        const six = [1, 2, 3, 4, 5, 6].map((n) => ev({ event_id: `e${n}` }));
+        try {
+            await assert.rejects(importEvents(writeRows(six), 'events-test.json', id, 2), /disk full/);      // 3 chunks of 2, the 2nd one fails
+        } finally { insert.mock.restore(); log.mock.restore(); }
+        assert.equal(await Event.countDocuments({ file_id: id }), 2);                                         // only the 1st chunk was saved
+        const run = await ImportRun.findOne().lean();
+        assert.deepEqual({ status: run!.status, error: run!.error, accepted: run!.accepted, file_id: run!.file_id },
+            { status: 'failed', error: 'disk full', accepted: 2, file_id: id });
     });
 });
 
