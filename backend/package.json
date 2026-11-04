@@ -9,7 +9,7 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "prestart": "npm run build",
-    "test": "TZ=UTC MONGO_URL=mongodb://localhost:27017/event_analytics_test PORT=0 EVENTS_FILE=/tmp/event-analytics-test.json node --import tsx --test --test-concurrency=1 --test-force-exit --test-reporter=spec test/*.test.ts"
+    "test": "TZ=UTC MONGO_URL=mongodb://localhost:27017/event_analytics_test PORT=0 node --import tsx --test --test-concurrency=1 --test-force-exit --test-reporter=spec test/*.test.ts"
   },
   "type": "commonjs",
   "private": true,

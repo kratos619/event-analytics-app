@@ -1,8 +1,5 @@
 import assert from 'node:assert/strict';
 import { before, beforeEach, after } from 'node:test';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
 import mongoose from 'mongoose';
 import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
@@ -18,16 +15,6 @@ export const ev = (over: object = {}) => ({ ...base, ...over });
 
 // saves events straight into the database, without an import. ids are e1, e2, ... unless a row sets its own
 export const seed = (rows: object[]) => Event.insertMany(rows.map((r, i) => ev({ event_id: `e${i + 1}`, ...r })));
-
-// the import reads a file, so a test writes its rows to a temp folder (removed when the tests end) and gets the path back.
-// Rows are saved as JSON; text is saved as it is, to make a file that is not JSON.
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'event-analytics-test-'));
-process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
-export const writeRows = (rows: unknown, name = 'events-test.json') => {
-    const file = path.join(dir, name);
-    fs.writeFileSync(file, typeof rows === 'string' ? rows : JSON.stringify(rows));
-    return file;
-};
 
 // connects to the test database and empties it before every test (call once at the top of a test file)
 export const useTestDb = () => {

@@ -4,7 +4,7 @@ import routes from './routes';
 import { errorHandler } from './middleware/errorHandler';
 
 const app = express();
-app.use(express.json());                                        // read JSON request bodies
+app.use(express.json({ limit: '50mb' }));                       // read JSON request bodies (an uploaded events file is one)
 app.get('/health', (req, res) => res.json({ ok: true }));      // test route
 app.use('/api', routes);                                        // all API routes live under /api
 app.use(errorHandler);                                          // must come last: turns thrown errors into responses

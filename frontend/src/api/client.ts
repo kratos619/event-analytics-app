@@ -13,9 +13,9 @@ export async function apiGet(path: string) {
     return res.json()
 }
 
-// same as apiGet, but sends a POST (used by the import button)
-export async function apiPost(path: string) {
-    const res = await fetch(`${BASE}${path}`, { method: 'POST' })
+// sends the picked file as the body of a POST (the events file is JSON), used by the import button
+export async function apiUpload(path: string, file: File) {
+    const res = await fetch(`${BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: file })
     const body = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(body.message ?? `API ${res.status}`)
     return body

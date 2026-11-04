@@ -1,6 +1,6 @@
 # Event Analytics Application
 
-This app imports `events_10000.json`, throws out the bad rows, removes duplicates, stores what is left
+This app imports an events file you pick in the browser (the brief's `events_10000.json`), throws out the bad rows, removes duplicates, stores what is left
 in MongoDB and shows it in a small React dashboard. The point of the exercise is that the numbers on
 the screen are the real ones: no invalid row and no repeated event is counted.
 
@@ -16,7 +16,7 @@ and write down the decisions.
 
 | The brief | Where it is |
 | --- | --- |
-| Import with a summary | `POST /api/import` and the "Import events file" button |
+| Import with a summary | `POST /api/import` and the file picker with the Import button |
 | Validation, rejected rows kept | `backend/models/Event.ts`, the `rejectedrecords` collection, the quality panel |
 | Deduplication, exact vs conflicting | `backend/services/importService.ts` |
 | Event time vs received time | daily chart (event day), "Late arrivals" card |
@@ -41,8 +41,9 @@ cd frontend
 npm install
 npm run dev
 
-# load the data: press "Import events file" on the page, or
-curl -X POST localhost:3000/api/import
+# load the data: choose backend/data/events_10000.json with the file picker on the page and press Import, or
+curl -X POST -H 'Content-Type: application/json' --data-binary @backend/data/events_10000.json \
+  'localhost:3000/api/import?file_name=events_10000.json'
 
 # tests (second terminal, backend folder)
 npm test
@@ -55,7 +56,6 @@ database, `event_analytics_test`, and empties it before every test, so it never 
 | --- | --- | --- |
 | `MONGO_URL` | `mongodb://localhost:27017/event_analytics` | database |
 | `PORT` | `3000` | backend port |
-| `EVENTS_FILE` | `data/events_10000.json` | the file the import reads |
 
 The frontend sends every `/api` call to port 3000 through the Vite dev server (`frontend/vite.config.ts`),
 so the backend needs no CORS setup.
@@ -92,7 +92,7 @@ backend/
     importController.ts   POST /api/import
     eventsController.ts   metrics, quality and the events list
   services/               the logic and the queries, no Express in here
-    importService.ts      read the file, validate, deduplicate, save, record the run
+    importService.ts      validate the rows of an uploaded file, deduplicate, save, record the run
     eventsService.ts      the queries behind the metrics, quality and events endpoints
   middleware/             validate (checks the URL query), errorHandler (errors become responses)
   validators/             the filter rules used by the validate middleware
@@ -216,7 +216,7 @@ with `test` in it. There are five files:
 - `filters.test.ts`: the filter rules, the validate middleware and the error handler (no database).
 - `events-service.test.ts`: every function in `eventsService` called directly on events saved straight
   into the database.
-- `import-service.test.ts`: `importEvents` called directly with a file path. It covers the cases from the
+- `import-service.test.ts`: `importEvents` called directly with the rows of a file. It covers the cases from the
   brief (a valid event, a missing id or bad timestamp, an exact and a conflicting duplicate, a second
   import) plus `file_id`, failed imports and the real 10,000-row file.
 - `api.test.ts`: the endpoints over HTTP, the 400 on every filtered route, and the 500 paths.
@@ -270,7 +270,7 @@ Where the brief left something open, this is what I assumed.
 
 | Endpoint | Returns |
 | --- | --- |
-| `POST /api/import` | reads the file, saves, returns the summary and the saved run |
+| `POST /api/import?file_name=...` | the body is the events file (a JSON array, up to 50 MB). Saves it and returns the summary and the saved run. `file_name` only labels the run |
 | `GET /api/metrics/by-type` | accepted events per event type |
 | `GET /api/metrics/daily` | accepted events per UTC event day |
 | `GET /api/metrics/by-dealer` | accepted events per dealer, biggest first |
@@ -371,7 +371,12 @@ Where I stepped in:
 - **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
   quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
   again adds its rows again.
-- **The import reads the whole file into memory**, so memory grows with the file (see Performance).
+- **The import reads the whole file into memory**, so memory grows with the file (see Performance). An
+  upload is limited to 50 MB, and the browser checks that before sending.
+- **A file that is not valid JSON, or not an array, is a 400 and is not saved as a failed run.** It never
+  reaches the import, so only imports that started and then failed show up as `failed` in `importruns`.
+- **The upload is the raw file as the request body**, not a multipart form. It needs no extra package, but
+  it only works for JSON files.
 - **Pagination uses `skip`**, which gets slow on very deep pages.
 - **Timestamps are strict.** Only UTC times ending in `Z` are accepted, so a valid ISO time with an offset
   such as `+05:30` is rejected. The brief says every good timestamp is UTC.
