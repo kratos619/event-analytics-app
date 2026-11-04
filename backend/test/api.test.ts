@@ -76,6 +76,15 @@ test('a late, out-of-order event is counted on its event date, not its received 
     assert.equal((await get('/api/metrics/late')).late, 1);
 });
 
+test('events per dealer: biggest first, filterable, and a bad filter is a 400', async () => {
+    await importRows([base, ev({ event_id: 'e2', dealer_id: 'd2' }), ev({ event_id: 'e3', dealer_id: 'd2' })]);
+    assert.deepEqual((await get('/api/metrics/by-dealer')).by_dealer, [{ dealer_id: 'd2', count: 2 }, { dealer_id: 'd1', count: 1 }]);
+    assert.deepEqual((await get('/api/metrics/by-dealer?dealer_id=d1')).by_dealer, [{ dealer_id: 'd1', count: 1 }]);
+    const bad = await fetch(`${url}/api/metrics/by-dealer?from=2026-09-05&to=2026-09-01`);
+    assert.equal(bad.status, 400);
+    assert.deepEqual(await bad.json(), { error: 'Bad Request', message: '"from" must not be after "to"' });
+});
+
 test('importing the same file again does not change the totals', async () => {
     const rows = [base, ev({ event_id: 'e2', event_type: 'EMAIL_SENT' }), ev({ event_id: 'e3', dealer_id: 'd2' })];
     await importRows(rows);

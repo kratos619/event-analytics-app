@@ -1,12 +1,14 @@
 import { Router } from 'express';
 import { importEvents } from '../controllers/importController';
 import { getByDealer, getByType, getDaily, getEvents, getLate, getQuality, getRejected } from '../controllers/eventsController';
+import { validateQuery } from '../middleware/validate';
+import { eventFiltersSchema } from '../validators/eventFilters';
 
 const router = Router();
 
 router.post('/import', importEvents);   // POST /api/import  -> read the file and save the events
 router.get('/metrics/daily', getDaily);         // accepted events per UTC event day
-router.get('/metrics/by-dealer', getByDealer);  // accepted events per dealer
+router.get('/metrics/by-dealer', validateQuery(eventFiltersSchema), getByDealer);  // accepted events per dealer
 router.get('/metrics/late', getLate);    
 router.get('/metrics/by-type', getByType); 
 router.get('/quality', getQuality);              // last import + counts per reason
