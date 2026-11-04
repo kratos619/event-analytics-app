@@ -18,13 +18,13 @@ and write down the decisions.
 | --- | --- |
 | Import with a summary | `POST /api/import` and the "Import events file" button |
 | Validation, rejected rows kept | `backend/models/Event.ts`, the `rejectedrecords` collection, the quality panel |
-| Deduplication, exact vs conflicting | `backend/controllers/importController.ts` |
+| Deduplication, exact vs conflicting | `backend/services/importService.ts` |
 | Event time vs received time | daily chart (event day), "Late arrivals" card |
 | Second import must not change the totals | see "Importing the same file twice" |
 | At least three metrics | by type, per day, by dealer, plus late arrivals |
 | Filtered API with validation | `backend/controllers/eventsController.ts` |
 | Dashboard | `frontend/` |
-| Tests for the edge cases | `backend/test/api.test.ts` |
+| Tests for the edge cases | `backend/test/` (`import-service.test.ts` for the import, `api.test.ts` for the endpoints) |
 
 ## Run it
 
@@ -88,11 +88,16 @@ browser  ->  Vite dev server (5173)  --/api-->  Express (3000)  ->  MongoDB
 backend/
   server.ts               express app, routes under /api, MongoDB connection
   routes/index.ts         URL to controller
-  controllers/
+  controllers/            HTTP only: read the request, call a service, send the answer
     importController.ts   POST /api/import
     eventsController.ts   metrics, quality and the events list
+  services/               the logic and the queries, no Express in here
+    importService.ts      read the file, validate, deduplicate, save, record the run
+    eventsService.ts      the queries behind the metrics, quality and events endpoints
+  middleware/             validate (checks the URL query), errorHandler (errors become responses)
+  validators/             the filter rules used by the validate middleware
   models/                 Event (schema, indexes, validateEvent), RejectedRecord, ImportRun
-  test/api.test.ts
+  test/                   validation, filters, services (against a test database) and the API
   data/events_10000.json  the file from the brief, unchanged
 frontend/
   src/api/client.ts       every fetch goes through here
@@ -105,9 +110,9 @@ frontend/
 
 | Collection | Fields |
 | --- | --- |
-| `events` | `event_id` (unique), `customer_id`, `dealer_id`, `event_type`, `event_timestamp`, `received_at`, `lead_created_at` (these three are dates), `campaign_id`, `segment`, `email_provider`, `lead_status` |
-| `rejectedrecords` | `row_number` (1-based position in the file), `reason`, `raw` (the original row as it came), `createdAt`, `updatedAt` |
-| `importruns` | `status` (`completed` or `failed`), `total_rows`, `accepted`, `exact_duplicates`, `conflicting_duplicates`, `invalid`, `duration_ms`, `error`, `createdAt` |
+| `events` | `event_id` (unique), `customer_id`, `dealer_id`, `event_type`, `event_timestamp`, `received_at`, `lead_created_at` (these three are dates), `campaign_id`, `segment`, `email_provider`, `lead_status`, `file_id` (the upload that first saved it) |
+| `rejectedrecords` | `file_id` (the upload it was rejected in), `row_number` (1-based position in that file), `reason`, `raw` (the original row as it came), `createdAt`, `updatedAt` |
+| `importruns` | `file_id` (one per upload, copied onto its events and rejected rows), `file_name`, `status` (`completed` or `failed`), `total_rows`, `accepted`, `exact_duplicates`, `conflicting_duplicates`, `invalid`, `duration_ms`, `error`, `createdAt` |
 
 ### Indexes and what uses them
 
@@ -123,8 +128,8 @@ app starts. There is no separate migration step.
   is fine at this size.
 - `event_type` has no index of its own. It has six values, so it filters badly alone, and the dealer and
   date filters already narrow the rows before the type is checked.
-- `rejectedrecords` and `importruns` have no extra indexes. They are small and read by row number or by
-  reason.
+- `rejectedrecords` has an index on `{ file_id, row_number }`: the quality screen reads the rejected rows of
+  one upload, in file order. `importruns` has no extra index, it is small.
 
 The metrics are computed by MongoDB with an aggregation (`$match`, `$group`, `$sort`), so the browser
 never receives all the events.
@@ -156,9 +161,11 @@ reason `CONFLICTING_DUPLICATE`. An invalid row never claims an id, because valid
 **Importing the same file twice.**
 Events already saved are loaded first (one query on the ids in the file), so every row of a second import
 is compared with what is stored. Nothing new is inserted and `events` does not change. The brief asks me
-to say whether repeated rows are recorded again. My choice: every import writes its own summary to
-`importruns`, and `rejectedrecords` holds the rows of the latest import only, exact duplicates included.
-After a second import it therefore has 10,000 rows, because every row is either invalid or already known.
+to say whether repeated rows are recorded again. My choice: every import gets its own `file_id`. It writes
+its own summary to `importruns`, and its rejected rows (exact duplicates included) are saved in
+`rejectedrecords` with the same `file_id`. Nothing is deleted, so a second import adds another 10,000
+rejected rows, because every row is either invalid or already known. The quality screen shows the latest
+import only, found by its `file_id`.
 The unique index on `event_id` is the safety net underneath.
 
 **Validation with Joi, in the model file.**
@@ -193,18 +200,31 @@ that turns the query string into a Mongo filter and rejects bad values with a 40
 One combined endpoint is possible and is on the list below.
 
 **Backend layout.**
-Plain MVC: `routes`, `controllers`, `models`. There is no service layer. With two controllers and
-one job (import) it would only add files. Import logic lives in `importController.ts` and the read
-endpoints in `eventsController.ts`.
+Routes call controllers, controllers call services, services use the models. A controller only reads
+the request and sends the answer. The import lives in `importService.ts` and the read queries in
+`eventsService.ts`, so both can be tested without HTTP. `GET /api/metrics/by-dealer` is written in the
+final shape (the route validates the query with middleware, the controller has no try/catch, and
+`errorHandler` turns errors into responses). The other handlers still validate and catch errors in the
+controller and can be moved the same way.
 
 **Tests use Node's built-in runner.**
-`node --test` through `tsx`, so there is no extra test dependency. Each test writes a few events to a
-temporary file and calls the real import endpoint, against the separate test database. They cover the
-six cases from the brief: a valid event is accepted, a missing id or bad timestamp is rejected, an
-exact duplicate is not counted twice, a conflicting duplicate does not overwrite the first event, a
-late and out-of-order event is counted on its event date, and a second import leaves the totals
-unchanged. I checked that two of them fail when the code is broken on purpose (the duplicate comparison,
-and grouping the daily trend by received time).
+`node --test` through `tsx`, so there is no extra test dependency. The files run one after another
+(`--test-concurrency=1`) because they share one test database, which needs a running MongoDB and a name
+with `test` in it. There are five files:
+
+- `event-validation.test.ts`: `validateEvent`, every reason code (no database).
+- `filters.test.ts`: the filter rules, the validate middleware and the error handler (no database).
+- `events-service.test.ts`: every function in `eventsService` called directly on events saved straight
+  into the database.
+- `import-service.test.ts`: `importEvents` called directly with a file path. It covers the cases from the
+  brief (a valid event, a missing id or bad timestamp, an exact and a conflicting duplicate, a second
+  import) plus `file_id`, failed imports and the real 10,000-row file.
+- `api.test.ts`: the endpoints over HTTP, the 400 on every filtered route, and the 500 paths.
+
+A filter day that does not exist (`from=2026-02-30`) is a 400 on every endpoint, instead of being read as
+March 2. To check the tests themselves I broke the code on purpose in 16 different ways (late threshold, date boundary, sort tie-break, duplicate
+comparison, `file_id`, deleting old rejected rows, failed-run record and others) and each one made at
+least one test fail.
 
 **Frontend.**
 React with Vite. Bootstrap comes from a CDN link, so there is no CSS to maintain. Recharts is used for the
@@ -255,8 +275,8 @@ Where the brief left something open, this is what I assumed.
 | `GET /api/metrics/daily` | accepted events per UTC event day |
 | `GET /api/metrics/by-dealer` | accepted events per dealer, biggest first |
 | `GET /api/metrics/late` | accepted total, late count, average delay in minutes |
-| `GET /api/quality` | the last import and the number of rows per reason |
-| `GET /api/quality/rejected` | rows that were not saved, with their original data |
+| `GET /api/quality` | the last import and the number of its rejected rows per reason |
+| `GET /api/quality/rejected` | rows the last import did not save, with their original data |
 | `GET /api/events` | accepted events, newest first |
 | `GET /health` | `{ "ok": true }` |
 
@@ -319,11 +339,11 @@ What it did: most of the code started as suggestions from Claude in chat (the va
 the metric queries, the React components and the tests). I typed or approved every file, ran it, and
 asked for changes. It also ran checks for me on scratch copies of the project.
 
-What I checked: I ran `npm test` (six tests). The numbers from the API were compared with numbers counted
+What I checked: I ran `npm test` (all tests pass). The numbers from the API were compared with numbers counted
 directly from the JSON file by a separate script (9,000, 300, 100, 600, the per-dealer and per-day counts
 and the 493 late events). I opened the dashboard and used the filters and the Import button, looked at
-the empty state, and saw the error state when the backend was off. Two of the tests were also run against
-code that had been broken on purpose to see them fail.
+the empty state, and saw the error state when the backend was off. The tests were also run against code
+that had been broken on purpose to see them fail.
 
 Where I stepped in:
 
@@ -348,8 +368,9 @@ Where I stepped in:
 
 - **Two imports at the same moment.** The unique index stops duplicates, but one of the two fails with a
   duplicate key error and has to be run again. The import is safe to restart, it is not atomic.
-- **`rejectedrecords` keeps only the latest import.** Counts per import are kept in `importruns`, the
-  rejected rows themselves are not.
+- **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
+  quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
+  again adds its rows again.
 - **The import reads the whole file into memory**, so memory grows with the file (see Performance).
 - **Pagination uses `skip`**, which gets slow on very deep pages.
 - **Timestamps are strict.** Only UTC times ending in `Z` are accepted, so a valid ISO time with an offset
@@ -363,8 +384,7 @@ Where I stepped in:
 I am sending this version first to stay inside the time box. I would change these next, in this order:
 
 1. Stream and batch the import, with ids looked up per chunk, to remove the memory growth.
-2. Make concurrent imports safe (upsert-based writes or a lock), and tag each rejected row with the import
-   it came from so `rejectedrecords` keeps history.
+2. Make concurrent imports safe (upsert-based writes or a lock).
 3. Return the dashboard metrics from one aggregation, or pre-computed daily totals if the data grows a lot.
 4. Cursor pagination instead of `skip`.
 5. Frontend: labels, proper types, a few UI tests.

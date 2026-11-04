@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
-import { EVENT_TYPES } from '../models/Event';
 import Joi from 'joi';
 import * as eventsService from '../services/eventsService';
+import { eventFiltersSchema } from '../validators/eventFilters';
 
 
 
@@ -12,21 +12,12 @@ const pageData = Joi.object({
 });
 
 
-// a day written like 2026-09-01 (UTC)
-const day = Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).custom((v, h) => (isNaN(Date.parse(v)) ? h.error('any.invalid') : v));
-const filterData = Joi.object({
-    dealer_id: Joi.string(),
-    event_type: Joi.string().valid(...EVENT_TYPES),
-    from: day,
-    to: day,
-});
-
 // turns the filters in the URL into a MongoDB $match. If a filter is wrong, error has the message
+// (the filter rules, including "from" not after "to", are in validators/eventFilters.ts)
 const buildMatch = (query: any) => {
     const match: any = {};
-    const { error, value } = filterData.validate(query);
+    const { error, value } = eventFiltersSchema.validate(query);
     if (error) return { match, error: error.message };
-    if (value.from && value.to && value.from > value.to) return { match, error: '"from" must not be after "to"' };
 
     if (value.dealer_id) match.dealer_id = value.dealer_id;
     if (value.event_type) match.event_type = value.event_type;

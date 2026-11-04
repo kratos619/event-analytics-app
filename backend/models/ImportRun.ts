@@ -2,7 +2,9 @@ import { Schema, model } from 'mongoose';
 
 const importRunSchema = new Schema(
   {
-    status:                 { type: String, enum: ['running', 'completed', 'failed'], default: 'running' },
+    file_id:                { type: String },              // one ID per upload; events and rejected rows of this run carry it too
+    file_name:              { type: String },              // the file that was imported
+    status:                { type: String, enum: ['running', 'completed', 'failed'], default: 'running' },
     total_rows:             { type: Number, default: 0 },  // rows read from the file
     accepted:               { type: Number, default: 0 },  // new events saved in this run
     exact_duplicates:       { type: Number, default: 0 },

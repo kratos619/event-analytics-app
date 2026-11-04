@@ -84,20 +84,23 @@ const getLate = async (match: Record<string, unknown>) => {
     };
 };
 
-// the last import, and how many rows were rejected for each reason
+// the last import, and how many of ITS rows were rejected for each reason
+// (file_id ?? null also matches rows saved before file_id existed)
 const getQuality = async () => {
-    const [last_import, rows] = await Promise.all([
-        ImportRun.findOne().sort({ createdAt: -1 }).select('-_id -__v').lean(),
-        RejectedRecord.aggregate([{ $group: { _id: '$reason', count: { $sum: 1 } } }, { $sort: { count: -1, _id: 1 } }]),
+    const last_import = await ImportRun.findOne().sort({ createdAt: -1 }).select('-_id -__v').lean();
+    const rows = await RejectedRecord.aggregate([
+        { $match: { file_id: last_import?.file_id ?? null } },
+        { $group: { _id: '$reason', count: { $sum: 1 } } },
+        { $sort: { count: -1, _id: 1 } },
     ]);
 
     return { last_import, by_reason: rows.map((r) => ({ reason: r._id, count: r.count })) };
 };
 
-// the rows we did not save, with the reason and the original row. reason narrows it down
+// the rows the last import did not save, with the reason and the original row. reason narrows it down
 const getRejected = async (page: number, limit: number, reason?: string) => {
-    const filter = reason ? { reason } : {};
-    console.log({ filter })
+    const last_import = await ImportRun.findOne().sort({ createdAt: -1 }).select('file_id').lean();
+    const filter = { file_id: last_import?.file_id ?? null, ...(reason && { reason }) };
     const [total, records] = await Promise.all([
         RejectedRecord.countDocuments(filter),
         RejectedRecord.find(filter).sort({ row_number: 1 }).skip((page - 1) * limit).limit(limit)

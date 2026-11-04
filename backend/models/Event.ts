@@ -13,6 +13,7 @@ const eventSchema = new Schema({
   segment:         { type: String },
   email_provider:  { type: String },
   lead_status:     { type: String },
+  file_id:         { type: String },   // the upload (ImportRun.file_id) that first saved this event
 });
 
 // indexes for the README filters: dealer, event date range
