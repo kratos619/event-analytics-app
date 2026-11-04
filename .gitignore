@@ -21,3 +21,6 @@ npm-debug.log*
 .vscode/
 .idea/
 backend/package-lock.json
+
+# files uploaded through the app
+backend/uploads/

@@ -9,7 +9,7 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "prestart": "npm run build",
-    "test": "TZ=UTC MONGO_URL=mongodb://localhost:27017/event_analytics_test PORT=0 node --import tsx --test --test-concurrency=1 --test-force-exit --test-reporter=spec test/*.test.ts"
+    "test": "TZ=UTC MONGO_URL=mongodb://localhost:27017/event_analytics_test PORT=0 UPLOAD_DIR=/tmp/event-analytics-test-uploads node --import tsx --test --test-concurrency=1 --test-force-exit --test-reporter=spec test/*.test.ts"
   },
   "type": "commonjs",
   "private": true,
@@ -19,10 +19,12 @@
   "dependencies": {
     "express": "^5.3.0",
     "joi": "^18.3.1",
-    "mongoose": "^9.11.4"
+    "mongoose": "^9.11.4",
+    "multer": "^2.5.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0",
     "@types/node": "^26.6.6",
     "nodemon": "^3.1.14",
     "tsx": "^4.23.15",

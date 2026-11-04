@@ -1,6 +1,7 @@
 // the filter rules, the validation middleware and the error handler: no database, no server
 import { test, describe, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import multer from 'multer';
 import { eventFiltersSchema } from '../validators/eventFilters';
 import { validateQuery } from '../middleware/validate';
 import { AppError, errorHandler } from '../middleware/errorHandler';
@@ -106,6 +107,19 @@ describe('errorHandler', () => {
         try {
             assert.deepEqual(send(new AppError(503, 'db is down')).body, { error: 'Service Unavailable', message: 'Something went wrong' });
         } finally { log.mock.restore(); }
+    });
+
+    test('an upload over the size limit is a 413', () => {
+        const out = send(new multer.MulterError('LIMIT_FILE_SIZE', 'file'));
+        assert.equal(out.status, 413);
+        assert.deepEqual(out.body, { error: 'Payload Too Large', message: 'File too large' });
+    });
+
+    test('any other upload mistake (a MulterError) is a 400', () => {
+        const out = send(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'document'));
+        assert.equal(out.status, 400);
+        assert.equal(out.body.error, 'Bad Request');
+        assert.ok(out.body.message);
     });
 
     test('an error from express.json() (it has .status) keeps its 400 and message', () => {

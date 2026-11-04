@@ -8,7 +8,8 @@ export class AppError extends Error {
 
 // the one place where errors become responses. 4xx show their message, 5xx are logged and hidden
 export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
-    const status = err.statusCode ?? err.status ?? 500;   // err.status: errors from express.json()
+    // err.status: errors from express.json(). A MulterError has a code: too big is 413, anything else is the client's mistake
+    const status = err.statusCode ?? err.status ?? (err.code === 'LIMIT_FILE_SIZE' ? 413 : err.name === 'MulterError' ? 400 : 500);
     if (status >= 500) console.error(err);
     res.status(status).send({ error: STATUS_CODES[status], message: status >= 500 ? 'Something went wrong' : err.message });
 };

@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import fs from 'fs';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
 import Event, { validateEvent } from '../models/Event';
@@ -8,13 +8,16 @@ const FIELDS = ['customer_id', 'dealer_id', 'event_type', 'event_timestamp', 'le
 const val = (v: any) => (v instanceof Date ? v.getTime() : v ?? null);    // dates are compared as numbers
 const isSame = (a: any, b: any) => FIELDS.every((f) => val(a[f]) === val(b[f]));
 
-// saves the new events of an uploaded file (rows = its parsed JSON), keeps the rejected rows and records the run.
-// { error } if rows is not an array (the caller makes it a 400), otherwise { result }.
-// If anything else goes wrong the run is saved as failed and the error is thrown
-const importEvents = async (rows: unknown, file_name: string) => {
+// reads an uploaded file from disk (filePath), saves its new events, keeps the rejected rows and records the run.
+// file_name is the name the user gave it, file_id is the one ID of this upload (it goes on everything saved).
+// { error } if the file is not a JSON array (the caller makes it a 400), otherwise { result }.
+// If anything else goes wrong (a file we cannot read, the database) the run is saved as failed and the error is thrown
+const importEvents = async (filePath: string, file_name: string, file_id: string) => {
     const start = Date.now();
-    const file_id = randomUUID();            // one ID for this upload
     try {
+        const text = await fs.promises.readFile(filePath, 'utf8');
+        let rows: unknown;
+        try { rows = JSON.parse(text); } catch (e: any) { return { error: `input file is not valid JSON: ${e.message}` }; }
         if (!Array.isArray(rows)) return { error: 'input file must be a JSON array' };
         const goodEntries: any[] = [];
         const rejectedEntries: { row_number: number; reason: string; raw: any }[] = [];

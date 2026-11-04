@@ -13,9 +13,12 @@ export async function apiGet(path: string) {
     return res.json()
 }
 
-// sends the picked file as the body of a POST (the events file is JSON), used by the import button
+// uploads the picked file as a form (field "file"), used by the import button
 export async function apiUpload(path: string, file: File) {
-    const res = await fetch(`${BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: file })
+    const form = new FormData()
+    form.append('file', file)
+    // no Content-Type header here: the browser sets it, and adds the boundary that separates the parts of the form
+    const res = await fetch(`${BASE}${path}`, { method: 'POST', body: form })
     const body = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(body.message ?? `API ${res.status}`)
     return body

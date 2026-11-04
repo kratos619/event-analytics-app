@@ -24,7 +24,8 @@ const ImportButton = ({ onDone }: { onDone: () => void }) => {
         setError('')
         setResult(null)
         try {
-            setResult(await apiUpload(`/api/import?file_name=${encodeURIComponent(file.name)}`, file))
+            let d = await apiUpload('/api/import', file)
+            setResult(d)
             setFile(null)
             if (picker.current) picker.current.value = ''   // empty the picker, so the same file can be picked again
             onDone()

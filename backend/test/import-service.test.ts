@@ -1,42 +1,44 @@
-// importEvents called directly with the rows of an uploaded file (no HTTP), against the test database
+// importEvents called directly with the path of a saved file (no HTTP), against the test database
 import { test, describe, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
 import { importEvents } from '../services/importService';
 import * as eventsService from '../services/eventsService';
-import { base, ev, useTestDb } from './helpers';
+import { base, ev, writeRows, useTestDb } from './helpers';
 
 useTestDb();
 
-// imports these rows as a file called events-test.json; the test fails if the service answers with an error
-const run = async (rows: unknown) => {
-    const out = await importEvents(rows, 'events-test.json');
+// imports a file made of these rows, as an upload called events-test.json; the test fails if the service answers with an error
+const run = async (rows: unknown, file_id = randomUUID()) => {
+    const out = await importEvents(writeRows(rows), 'events-test.json', file_id);
     assert.equal(out.error, undefined);
     return out.result!;
 };
 const counts = (r: any) => ({ total_rows: r.total_rows, accepted: r.accepted, exact: r.exact_duplicates, conflicting: r.conflicting_duplicates, invalid: r.invalid });
 
 describe('a clean file', () => {
-    test('saves the events and records the run', async () => {
+    test('reads the file, saves the events and records the run', async () => {
         const result = await run([base, ev({ event_id: 'e2' })]);
         assert.deepEqual(counts(result), { total_rows: 2, accepted: 2, exact: 0, conflicting: 0, invalid: 0 });
         assert.equal(result.run.status, 'completed');
         assert.equal(result.run.file_name, 'events-test.json');
-        assert.match(result.run.file_id!, /^[0-9a-f-]{36}$/);
         assert.equal(typeof result.run.duration_ms, 'number');
         assert.equal(await Event.countDocuments(), 2);
         assert.equal(await RejectedRecord.countDocuments(), 0);
         assert.ok((await Event.findOne({ event_id: 'e1' }).lean())!.event_timestamp instanceof Date);   // stored as a real date
     });
 
-    test('the run is saved with the name of the file that was uploaded', async () => {
-        const out = await importEvents([base], 'my events (March).json');
+    test('the run uses the file_id and the file name it is given, not the name of the file on disk', async () => {
+        const id = randomUUID();
+        const out = await importEvents(writeRows([base], 'stored-as-something-else.json'), 'my events (March).json', id);
+        assert.equal(out.result!.run.file_id, id);
         assert.equal(out.result!.run.file_name, 'my events (March).json');
-        assert.equal((await ImportRun.findOne().lean())!.file_name, 'my events (March).json');
+        const saved = await ImportRun.findOne().lean();
+        assert.deepEqual({ file_id: saved!.file_id, file_name: saved!.file_name }, { file_id: id, file_name: 'my events (March).json' });
     });
 
     test('the run in the answer is the run that was saved', async () => {
@@ -136,7 +138,7 @@ describe('file_id: one per import, on the run, its events and its rejected rows'
     beforeEach(() => { log = mock.method(console, 'log', () => {}); });
     afterEach(() => log.mock.restore());
 
-    test('each import has its own id, and events and rejected rows carry the id of their import', async () => {
+    test('events and rejected rows carry the file_id of their import', async () => {
         const first = (await run([base, ev({ event_id: '' })])).run;                                          // 1 saved, 1 rejected
         const second = (await run([ev({ event_id: 'e2' }), ev({ event_id: 'e3', customer_id: null })])).run;  // 1 saved, 1 rejected
         assert.notEqual(first.file_id, second.file_id);
@@ -144,13 +146,6 @@ describe('file_id: one per import, on the run, its events and its rejected rows'
         assert.equal((await Event.findOne({ event_id: 'e2' }).lean())!.file_id, second.file_id);
         assert.equal(await RejectedRecord.countDocuments({ file_id: first.file_id }), 1);
         assert.equal(await RejectedRecord.countDocuments({ file_id: second.file_id }), 1);
-    });
-
-    test('the same file uploaded twice is two imports with two ids', async () => {
-        const first = (await run([base])).run;
-        const second = (await run([base])).run;
-        assert.notEqual(first.file_id, second.file_id);
-        assert.equal(await ImportRun.countDocuments(), 2);
     });
 
     test('the rejected rows of an earlier import are kept', async () => {
@@ -183,36 +178,55 @@ describe('when the import cannot finish', () => {
     beforeEach(() => { log = mock.method(console, 'error', () => {}); });   // the service logs failures on purpose
     afterEach(() => log.mock.restore());
 
-    test('rows that are not an array: { error }, nothing saved, no run recorded', async () => {
-        for (const rows of [{ events: [base] }, 'text', 5, null, undefined, true]) {
-            assert.deepEqual(await importEvents(rows, 'events-test.json'), { error: 'input file must be a JSON array' }, JSON.stringify(rows));
+    test('a file that is not an array: { error }, nothing saved, no run recorded', async () => {
+        for (const content of [{ events: [base] }, 'text', 5, null, true]) {
+            const out = await importEvents(writeRows(JSON.stringify(content)), 'events-test.json', randomUUID());   // JSON text, not rows
+            assert.deepEqual(out, { error: 'input file must be a JSON array' }, JSON.stringify(content));
         }
         assert.equal(await ImportRun.countDocuments(), 0);
         assert.equal(await Event.countDocuments(), 0);
     });
 
+    test('a file that is not JSON: { error } with the parser message, no run recorded', async () => {
+        const out = await importEvents(writeRows('event_id,customer_id\ne1,c1'), 'events.json', randomUUID());
+        assert.match(out.error!, /^input file is not valid JSON: /);
+        assert.equal(out.result, undefined);
+        assert.equal(await ImportRun.countDocuments(), 0);
+        assert.equal(log.mock.callCount(), 0);                                // a client mistake is not logged as a failure
+    });
+
+    test('a file that cannot be read: the error is thrown and a failed run is saved', async () => {
+        const id = randomUUID();
+        await assert.rejects(importEvents(path.join(path.dirname(writeRows([])), 'no-such-file.json'), 'events.json', id), /ENOENT/);
+        const saved = await ImportRun.findOne().lean();
+        assert.equal(saved!.status, 'failed');
+        assert.equal(saved!.file_id, id);
+        assert.equal(saved!.file_name, 'events.json');
+        assert.ok(saved!.error);
+        assert.equal(log.mock.callCount(), 1);
+    });
+
     test('the database fails while saving: a failed run with that error and the file name, and no completed run', async () => {
+        const id = randomUUID();
         const insert = mock.method(Event, 'insertMany', async () => { throw new Error('disk full'); });
         try {
-            await assert.rejects(importEvents([base, ev({ event_id: '' })], 'events-test.json'), /disk full/);
+            await assert.rejects(importEvents(writeRows([base, ev({ event_id: '' })]), 'events-test.json', id), /disk full/);
         } finally { insert.mock.restore(); }
         const runs = await ImportRun.find().lean();
         assert.equal(runs.length, 1);
-        assert.equal(runs[0].status, 'failed');
-        assert.equal(runs[0].error, 'disk full');
-        assert.equal(runs[0].file_name, 'events-test.json');
-        assert.ok(runs[0].file_id);
+        assert.deepEqual({ status: runs[0].status, error: runs[0].error, file_id: runs[0].file_id, file_name: runs[0].file_name },
+            { status: 'failed', error: 'disk full', file_id: id, file_name: 'events-test.json' });
         assert.equal(await Event.countDocuments(), 0);
-        assert.equal(log.mock.callCount(), 1);
     });
 });
 
-// the sample file that ships with the project, so the numbers are the real ones
+// the sample file that ships with the project, read straight from where it is, so the numbers are the real ones
 describe('the 10,000-row sample file', () => {
-    const SAMPLE = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'events_10000.json'), 'utf8'));
+    const SAMPLE = path.join(__dirname, '..', 'data', 'events_10000.json');
+    const importSample = () => importEvents(SAMPLE, 'events_10000.json', randomUUID());
 
     test('summary and reasons', async () => {
-        const out = await importEvents(SAMPLE, 'events_10000.json');
+        const out = await importSample();
         assert.deepEqual(counts(out.result), { total_rows: 10000, accepted: 9000, exact: 300, conflicting: 100, invalid: 600 });
         assert.equal(await Event.countDocuments(), 9000);
         assert.equal(await RejectedRecord.countDocuments(), 1000);
@@ -225,8 +239,8 @@ describe('the 10,000-row sample file', () => {
     });
 
     test('importing it a second time saves nothing and every row is rejected', async () => {
-        await importEvents(SAMPLE, 'events_10000.json');
-        const again = await importEvents(SAMPLE, 'events_10000.json');
+        await importSample();
+        const again = await importSample();
         // the 9,000 saved rows and the 300 exact repeats are now exact duplicates; conflicts and invalid rows stay what they were
         assert.deepEqual(counts(again.result), { total_rows: 10000, accepted: 0, exact: 9300, conflicting: 100, invalid: 600 });
         assert.equal(await Event.countDocuments(), 9000);

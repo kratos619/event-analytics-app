@@ -42,8 +42,7 @@ npm install
 npm run dev
 
 # load the data: choose backend/data/events_10000.json with the file picker on the page and press Import, or
-curl -X POST -H 'Content-Type: application/json' --data-binary @backend/data/events_10000.json \
-  'localhost:3000/api/import?file_name=events_10000.json'
+curl -F 'file=@backend/data/events_10000.json' localhost:3000/api/import
 
 # tests (second terminal, backend folder)
 npm test
@@ -56,6 +55,7 @@ database, `event_analytics_test`, and empties it before every test, so it never 
 | --- | --- | --- |
 | `MONGO_URL` | `mongodb://localhost:27017/event_analytics` | database |
 | `PORT` | `3000` | backend port |
+| `UPLOAD_DIR` | `uploads` (inside `backend/`) | where uploaded files are kept |
 
 The frontend sends every `/api` call to port 3000 through the Vite dev server (`frontend/vite.config.ts`),
 so the backend needs no CORS setup.
@@ -92,9 +92,11 @@ backend/
     importController.ts   POST /api/import
     eventsController.ts   metrics, quality and the events list
   services/               the logic and the queries, no Express in here
-    importService.ts      validate the rows of an uploaded file, deduplicate, save, record the run
+    importService.ts      read an uploaded file from disk, validate, deduplicate, save, record the run
     eventsService.ts      the queries behind the metrics, quality and events endpoints
-  middleware/             validate (checks the URL query), errorHandler (errors become responses)
+  middleware/             upload (saves the uploaded file to disk), validate (checks the URL query),
+                          errorHandler (errors become responses)
+  uploads/                the uploaded files, one per import, named <file_id>.json (not in git)
   validators/             the filter rules used by the validate middleware
   models/                 Event (schema, indexes, validateEvent), RejectedRecord, ImportRun
   test/                   validation, filters, services (against a test database) and the API
@@ -216,10 +218,11 @@ with `test` in it. There are five files:
 - `filters.test.ts`: the filter rules, the validate middleware and the error handler (no database).
 - `events-service.test.ts`: every function in `eventsService` called directly on events saved straight
   into the database.
-- `import-service.test.ts`: `importEvents` called directly with the rows of a file. It covers the cases from the
+- `import-service.test.ts`: `importEvents` called directly with the path of a saved file. It covers the cases from the
   brief (a valid event, a missing id or bad timestamp, an exact and a conflicting duplicate, a second
   import) plus `file_id`, failed imports and the real 10,000-row file.
-- `api.test.ts`: the endpoints over HTTP, the 400 on every filtered route, and the 500 paths.
+- `api.test.ts`: the endpoints over HTTP, the upload (the file is saved to disk with the content that was
+  sent), the 400 on every filtered route, and the 500 paths. It uses its own upload folder (`UPLOAD_DIR`).
 
 A filter day that does not exist (`from=2026-02-30`) is a 400 on every endpoint, instead of being read as
 March 2. To check the tests themselves I broke the code on purpose in 16 different ways (late threshold, date boundary, sort tie-break, duplicate
@@ -270,7 +273,7 @@ Where the brief left something open, this is what I assumed.
 
 | Endpoint | Returns |
 | --- | --- |
-| `POST /api/import?file_name=...` | the body is the events file (a JSON array, up to 50 MB). Saves it and returns the summary and the saved run. `file_name` only labels the run |
+| `POST /api/import` | a form with the events file in the field `file` (a `.json` file holding an array, up to 50 MB). The file is saved to `uploads/` as `<file_id>.json`, then imported from there. Returns the summary and the saved run |
 | `GET /api/metrics/by-type` | accepted events per event type |
 | `GET /api/metrics/daily` | accepted events per UTC event day |
 | `GET /api/metrics/by-dealer` | accepted events per dealer, biggest first |
@@ -371,12 +374,18 @@ Where I stepped in:
 - **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
   quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
   again adds its rows again.
-- **The import reads the whole file into memory**, so memory grows with the file (see Performance). An
-  upload is limited to 50 MB, and the browser checks that before sending.
-- **A file that is not valid JSON, or not an array, is a 400 and is not saved as a failed run.** It never
-  reaches the import, so only imports that started and then failed show up as `failed` in `importruns`.
-- **The upload is the raw file as the request body**, not a multipart form. It needs no extra package, but
-  it only works for JSON files.
+- **The import reads the whole file into memory** after it is saved, so memory grows with the file (see
+  Performance). An upload is limited to 50 MB, and the browser checks that before sending. Saving to disk
+  is what would let a streaming parser or a background job take over later.
+- **A file that is not valid JSON, or not an array, is a 400.** It is deleted again and is not saved as a
+  failed run, so only imports that started and then failed show up as `failed` in `importruns`.
+- **Uploaded files are never deleted.** A file stays in `uploads/` exactly when a run with its `file_id`
+  exists (also a failed one, so it can be looked at). There is no clean-up job, so the folder grows with
+  every import, and uploading the same file twice keeps two copies.
+- **Only `.json` files are accepted**, one per request. Other formats such as CSV would need a parser step
+  before the import.
+- **Some browsers and tools send a file name that multer reads wrongly** (it decodes names as latin1). The
+  controller converts it back to UTF-8, which is what browsers send.
 - **Pagination uses `skip`**, which gets slow on very deep pages.
 - **Timestamps are strict.** Only UTC times ending in `Z` are accepted, so a valid ISO time with an offset
   such as `+05:30` is rejected. The brief says every good timestamp is UTC.

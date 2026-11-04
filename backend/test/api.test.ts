@@ -1,5 +1,5 @@
-// the real app over HTTP: routes, controllers, validation, the error handler and the import (the file is the request body)
-import { test, describe, before, after, mock } from 'node:test';
+// the real app over HTTP: routes, controllers, validation, the error handler and the import (the file is uploaded as a form)
+import { test, describe, before, beforeEach, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
@@ -8,6 +8,7 @@ import app from '../server';
 import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
+import { UPLOAD_DIR } from '../middleware/upload';
 import { base, ev, seed, useTestDb } from './helpers';
 
 useTestDb();
@@ -15,21 +16,29 @@ useTestDb();
 let server: http.Server;
 let url = '';
 before(() => {
+    assert.match(UPLOAD_DIR, /test/, 'UPLOAD_DIR must be a test folder: the tests empty it');
     server = http.createServer(app).listen(0);                       // our own port for the requests
     url = `http://localhost:${(server.address() as any).port}`;
     mock.method(console, 'log', () => {});                           // getRejected logs its filter on every call
 });
-after(() => { server.close(); mock.restoreAll(); });
+after(() => { server.close(); mock.restoreAll(); fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); });
 
-// every call gives { status, body }; body is null if the answer is not JSON. `text` is sent as a JSON request body
-const call = async (method: string, route: string, text?: string) => {
-    const init = text === undefined ? { method } : { method, headers: { 'content-type': 'application/json' }, body: text };
-    const res = await fetch(url + route, init);
+// the names of the files the app keeps on disk
+const stored = () => (fs.existsSync(UPLOAD_DIR) ? fs.readdirSync(UPLOAD_DIR) : []);
+beforeEach(() => { for (const name of stored()) fs.rmSync(path.join(UPLOAD_DIR, name), { force: true }); });   // every test starts with no stored files
+
+// every call gives { status, body }; body is null if the answer is not JSON
+const call = async (method: string, route: string, body?: RequestInit['body']) => {
+    const res = await fetch(url + route, { method, body });
     return { status: res.status, body: (await res.json().catch(() => null)) as any };
 };
 const get = (route: string) => call('GET', route);
-// uploads a file like the browser does: the file name in the URL, the file itself (text) as the body
-const upload = (text: string, name = 'events-test.json') => call('POST', `/api/import?file_name=${encodeURIComponent(name)}`, text);
+// uploads a file like the browser does: a form with the file in the field "file"
+const upload = (text: string, name = 'events-test.json', field = 'file') => {
+    const form = new FormData();
+    form.append(field, new Blob([text], { type: 'application/json' }), name);
+    return call('POST', '/api/import', form);
+};
 const importRows = (rows: unknown, name?: string) => upload(JSON.stringify(rows), name);
 const quiet = () => mock.method(console, 'error', () => {});         // the app logs failures on purpose
 
@@ -39,7 +48,7 @@ describe('health', () => {
 });
 
 describe('import (POST /api/import)', () => {
-    // the details of the import are tested on importEvents in import-service.test.ts; here only what the controller adds
+    // the details of the import are tested on importEvents in import-service.test.ts; here only what the upload and the controller add
     test('a clean file: 200 with the summary and the run', async () => {
         const { status, body } = await importRows([base, ev({ event_id: 'e2' }), ev({ event_id: '' })]);
         assert.equal(status, 200);
@@ -51,37 +60,51 @@ describe('import (POST /api/import)', () => {
         assert.equal(await Event.countDocuments(), 2);
     });
 
-    test('the run is labelled with the file name from the URL, whatever characters it has', async () => {
-        const { body } = await importRows([base], 'my events (March) & más.json');
-        assert.equal(body.run.file_name, 'my events (March) & más.json');
+    describe('the upload is saved to disk and the import reads it from there', () => {
+        test('as <file_id>.json, with exactly the content that was uploaded', async () => {
+            const text = JSON.stringify([base, ev({ event_id: 'e2' })], null, 2);
+            const { body } = await upload(text);
+            assert.deepEqual(stored(), [`${body.run.file_id}.json`]);
+            assert.equal(fs.readFileSync(path.join(UPLOAD_DIR, `${body.run.file_id}.json`), 'utf8'), text);
+            assert.equal(await Event.countDocuments({ file_id: body.run.file_id }), 2);      // the same id is on the events
+        });
+
+        test('every upload is its own file, even the same file twice', async () => {
+            const first = (await importRows([base])).body.run;
+            const second = (await importRows([base])).body.run;
+            assert.notEqual(first.file_id, second.file_id);
+            assert.deepEqual(stored().sort(), [`${first.file_id}.json`, `${second.file_id}.json`].sort());
+        });
+
+        test('the run keeps the name the user gave the file, whatever characters it has', async () => {
+            for (const name of ['events_10000.json', 'my events (March) & más.json', 'データ.json', 'UPPER.JSON']) {
+                const { status, body } = await importRows([ev({ event_id: name })], name);
+                assert.equal(status, 200, name);
+                assert.equal(body.run.file_name, name);
+            }
+        });
     });
 
-    test('without a file name the run is labelled "unknown"', async () => {
-        const { body } = await call('POST', '/api/import', JSON.stringify([base]));
-        assert.equal(body.run.file_name, 'unknown');
-    });
-
-    describe('a request that is not a JSON array is a 400 and records no run', () => {
-        const notAnArray = { error: 'Bad Request', message: 'input file must be a JSON array' };
-        test('a JSON object', async () => {
-            assert.deepEqual(await importRows({ events: [] }), { status: 400, body: notAnArray });
-            assert.equal(await ImportRun.countDocuments(), 0);
-        });
-        test('no body at all', async () => {
-            assert.deepEqual(await call('POST', '/api/import'), { status: 400, body: notAnArray });
-            assert.equal(await ImportRun.countDocuments(), 0);
-        });
-        test('text that is not JSON (the body parser answers)', async () => {
-            const { status, body } = await upload('{ not json');
+    describe('a request that cannot be imported is a 400, records no run and keeps no file', () => {
+        const rejectedAtTheDoor = async (promise: ReturnType<typeof upload>, message: RegExp) => {
+            const { status, body } = await promise;
             assert.equal(status, 400);
             assert.equal(body.error, 'Bad Request');
-            assert.ok(body.message);
+            assert.match(body.message, message);
             assert.equal(await ImportRun.countDocuments(), 0);
             assert.equal(await Event.countDocuments(), 0);
-        });
+            assert.deepEqual(stored(), []);
+        };
+
+        test('a form with no file', () => rejectedAtTheDoor(call('POST', '/api/import', new FormData()), /attach a \.json file/));
+        test('no body at all', () => rejectedAtTheDoor(call('POST', '/api/import'), /attach a \.json file/));
+        test('the file is in another field than "file"', () => rejectedAtTheDoor(upload('[]', 'events.json', 'document'), /./));
+        test('a file that is not .json', () => rejectedAtTheDoor(upload('event_id,customer_id\ne1,c1', 'events.csv'), /attach a \.json file/));
+        test('a .json file with text that is not JSON', () => rejectedAtTheDoor(upload('{ not json'), /not valid JSON/));
+        test('a JSON object instead of an array', () => rejectedAtTheDoor(upload('{"events": []}'), /must be a JSON array/));
     });
 
-    test('the database fails while saving: 500, and a failed run is recorded', async () => {
+    test('the database fails while saving: 500, a failed run, and the file is kept', async () => {
         const log = quiet();
         const insert = mock.method(Event, 'insertMany', async () => { throw new Error('disk full'); });
         try {
@@ -91,6 +114,7 @@ describe('import (POST /api/import)', () => {
         assert.equal(run!.status, 'failed');
         assert.equal(run!.error, 'disk full');
         assert.equal(run!.file_name, 'events-test.json');
+        assert.deepEqual(stored(), [`${run!.file_id}.json`]);                                 // a run points to this file, so it stays
         assert.equal((await get('/api/quality')).body.last_import.status, 'failed');
     });
 
@@ -106,13 +130,14 @@ describe('import (POST /api/import)', () => {
         assert.equal(await RejectedRecord.countDocuments(), 3);                                               // the first import's rows are still there
     });
 
-    // the sample file that ships with the project: 4 MB, so this also proves a big file gets through the body limit
+    // the sample file that ships with the project (4 MB), uploaded the way the browser does it
     test('the 10,000-row sample file: every endpoint agrees', async () => {
         const text = fs.readFileSync(path.join(__dirname, '..', 'data', 'events_10000.json'), 'utf8');
         const { status, body } = await upload(text, 'events_10000.json');
         assert.equal(status, 200);
         assert.equal(body.accepted, 9000);
         assert.equal(body.run.file_name, 'events_10000.json');
+        assert.equal(fs.statSync(path.join(UPLOAD_DIR, `${body.run.file_id}.json`)).size, Buffer.byteLength(text));
         const sum = (rows: { count: number }[]) => rows.reduce((s, r) => s + r.count, 0);
         assert.equal((await get('/api/metrics/by-type')).body.total, 9000);
         assert.equal(sum((await get('/api/metrics/daily')).body.daily), 9000);
