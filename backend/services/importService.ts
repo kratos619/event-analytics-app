@@ -104,6 +104,7 @@ const processChunk = async (rows: any[], start: number, file_id: string): Promis
             const reason = isSame(storedById.get(g.event.event_id), g.event) ? 'EXACT_DUPLICATE' : 'CONFLICTING_DUPLICATE';
             rejectedEntries.push({ row_number: g.row_number, reason, raw: g.raw });
         }
+        console.warn(`[import] file_id=${file_id}: ${lost.length} event(s) were saved by another import at the same moment, recorded as duplicates`);
     }
 
     // counted after the write, because a row that lost the race became a duplicate
@@ -118,10 +119,13 @@ const processChunk = async (rows: any[], start: number, file_id: string): Promis
 // removes everything one import saved. Every event it inserted and every rejected row carries its file_id
 // (an event that was already saved keeps the file_id of the import that first saved it, so it is not touched).
 // ponytail: events have no index on file_id, so this scans the collection; fine because rollbacks are rare
-const rollBack = (file_id: string) => Promise.all([
-    Event.deleteMany({ file_id }),
-    RejectedRecord.deleteMany({ file_id }),
-]);
+const rollBack = async (file_id: string) => {
+    const [events, rejected] = await Promise.all([
+        Event.deleteMany({ file_id }),
+        RejectedRecord.deleteMany({ file_id }),
+    ]);
+    console.warn(`[import] rolled back file_id=${file_id}: removed ${events.deletedCount} events and ${rejected.deletedCount} rejected rows`);
+};
 
 // streams an uploaded file from disk (filePath), saves its new events chunk by chunk, keeps the rejected rows and records the run.
 // file_name is the name the user gave it, file_id is the one ID of this upload (it goes on everything saved).
@@ -140,6 +144,7 @@ const importEvents = async (filePath: string, file_name: string, file_id: string
 
     // the run exists from the start, so even a crash half way leaves a trace (see recoverInterruptedImports)
     await ImportRun.create({ file_id, file_name, status: 'running' });
+    console.log(`[import] started ${file_name} (file_id=${file_id})`);
     try {
         for await (const chunk of readInChunks(filePath, chunkSize)) {
             const chunkCounts = await processChunk(chunk.rows, chunk.start, file_id);
@@ -156,14 +161,18 @@ const importEvents = async (filePath: string, file_name: string, file_id: string
             { $set: { ...counts(), status: 'completed', duration_ms: Date.now() - start } },
             { returnDocument: 'after' },   // answer with the run as it is now
         );
+        console.log(`[import] done ${file_name}: ${total_rows} rows -> ${totals.accepted} accepted, ${totals.exact} exact duplicates, `
+            + `${totals.conflicting} conflicting, ${totals.invalid} invalid, in ${Date.now() - start} ms`);
         return { ...counts(), run: run! };
     } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
+        // a bad file is the client's mistake (warning); anything else, like the database, is ours (error)
+        const report = e instanceof AppError ? console.warn : console.error;
+        report(`[import] failed ${file_name} (file_id=${file_id}) after ${total_rows} rows: ${message}`);
         await rollBack(file_id);
         await ImportRun.updateOne({ file_id }, {
             $set: { ...counts(), status: 'failed', error: message, rolled_back: true, duration_ms: Date.now() - start },
         });
-        console.error('import failed, rolled back:', message);
         throw e;
     }
 };
@@ -174,6 +183,7 @@ const importEvents = async (filePath: string, file_name: string, file_id: string
 const recoverInterruptedImports = async () => {
     const runs = await ImportRun.find({ status: 'running' }).lean();
     for (const run of runs) {
+        console.warn(`[startup] import of ${run.file_name} (file_id=${run.file_id}) was cut off after ${run.total_rows} rows, rolling it back`);
         if (run.file_id) await rollBack(run.file_id);
         await ImportRun.updateOne({ _id: run._id }, {
             $set: { status: 'failed', error: 'interrupted: the server stopped during this import', rolled_back: true },

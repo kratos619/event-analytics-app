@@ -3,7 +3,7 @@ import type { ChangeEvent } from 'react'
 import { apiUpload } from '../api/client'
 
 const MAX_MB = 50      // per file: the backend refuses a bigger file, so say so before uploading it
-const MAX_FILES = 20   // per pick: every file is safe on its own, but hundreds would keep the user waiting for minutes
+const MAX_FILES = 5   // per pick: every file is safe on its own, but hundreds would keep the user waiting for minutes
 
 // one line per picked file, and how far it got
 type Item = {

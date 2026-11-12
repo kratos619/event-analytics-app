@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { before, beforeEach, after } from 'node:test';
+import { before, beforeEach, after, mock } from 'node:test';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -31,6 +31,8 @@ export const writeRows = (rows: unknown, name = 'rows.json') => {
 
 // connects to the test database and empties it before every test (call once at the top of a test file)
 export const useTestDb = () => {
+    // the app logs every request and import; keep the test output readable (errors still print)
+    before(() => { mock.method(console, 'log', () => {}); mock.method(console, 'warn', () => {}); });
     before(async () => {
         assert.match(process.env.MONGO_URL ?? '', /test/, 'the tests wipe the database, so MONGO_URL must be a test database');
         if (mongoose.connection.readyState === 0) await mongoose.connect(process.env.MONGO_URL!);

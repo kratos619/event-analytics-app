@@ -8,6 +8,13 @@ import ImportRun from './models/ImportRun';
 import { recoverInterruptedImports } from './services/importService';
 
 const app = express();
+
+// one line per request when the answer is sent: method, URL, status and how long it took
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => console.log(`[http] ${req.method} ${req.originalUrl} -> ${res.statusCode} in ${Date.now() - start} ms`));
+    next();
+});
 app.use(express.json());                                        // read JSON request bodies
 app.get('/health', (req, res) => res.json({ ok: true }));      // test route
 app.use('/api', routes);                                        // all API routes live under /api
@@ -26,9 +33,14 @@ mongoose
     .then(async () => {
         // imports a crash or restart cut off: roll back their half-saved data, mark them failed
         const interrupted = await recoverInterruptedImports();
-        if (interrupted > 0) console.warn(`${interrupted} interrupted import(s) rolled back and marked failed`);
+        if (interrupted > 0) console.warn(`[startup] ${interrupted} interrupted import(s) rolled back and marked failed`);
     })
-    .then(() => app.listen(PORT, () => console.log(`server on ${PORT}, mongo connected, indexes ready`)))
-    .catch((err) => { console.error('server failed to start:', err.message); process.exit(1); });
+    // the database name only: the full MONGO_URL can contain a password, so it is never logged
+    .then(() => app.listen(PORT, () => console.log(`[startup] server on ${PORT}, database "${mongoose.connection.name}" connected, indexes ready`)))
+    .catch((err) => { console.error('[startup] server failed to start:', err.message); process.exit(1); });
+
+// if MongoDB goes away while the server runs, say so (the driver reconnects by itself)
+mongoose.connection.on('disconnected', () => console.warn('[db] MongoDB disconnected'));
+mongoose.connection.on('reconnected', () => console.log('[db] MongoDB reconnected'));
 
 export default app;
