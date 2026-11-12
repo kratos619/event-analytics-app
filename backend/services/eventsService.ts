@@ -2,13 +2,30 @@ import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
 
+// the filters a caller can ask for. Already validated by the route, so the service only has to use them
+interface EventFilters { dealer_id?: string; event_type?: string; from?: string; to?: string }
+type EventMatch = { dealer_id?: string; event_type?: string; event_timestamp?: { $gte?: Date; $lte?: Date } };
+
+// turns the filters into a MongoDB $match (the only place that does this)
+const toMatch = ({ dealer_id, event_type, from, to }: EventFilters) => {
+    const match: EventMatch = {};
+    if (dealer_id) match.dealer_id = dealer_id;
+    if (event_type) match.event_type = event_type;
+    if (from || to) {
+        match.event_timestamp = {};
+        if (from) match.event_timestamp.$gte = new Date(`${from}T00:00:00Z`);   // from: start of that day, UTC
+        if (to) match.event_timestamp.$lte = new Date(`${to}T23:59:59.999Z`);   // to: end of that day, UTC
+    }
+    return match;
+};
+
 // how many accepted events of each type
-const getByType = async (match: Record<string, unknown>) => {
+const getByType = async (filters: EventFilters) => {
     // check redis, return data from redis if exists
     // key: events:byType:dealer_id:from:to
 
     const rows = await Event.aggregate([
-        { $match: match },
+        { $match: toMatch(filters) },
         { $group: { _id: '$event_type', count: { $sum: 1 } } },   // like: SELECT event_type, COUNT(*) ... GROUP BY event_type
         { $sort: { _id: 1 } },
     ]);
@@ -22,30 +39,14 @@ const getByType = async (match: Record<string, unknown>) => {
 };
 
 // how many accepted events on each UTC day
-const getDaily = async (match: Record<string, unknown>) => {
+const getDaily = async (filters: EventFilters) => {
     const rows = await Event.aggregate([
-        { $match: match },
+        { $match: toMatch(filters) },
         { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$event_timestamp', timezone: 'UTC' } }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
     ]);
 
     return { daily: rows.map((r) => ({ day: r._id, count: r.count })) };
-};
-
-// the filters a caller can ask for. Already validated, so the service only has to use them
-interface EventFilters { dealer_id?: string; event_type?: string; from?: string; to?: string }
-
-// turns the filters into a MongoDB $match
-const toMatch = ({ dealer_id, event_type, from, to }: EventFilters) => {
-    const match: Record<string, any> = {};
-    if (dealer_id) match.dealer_id = dealer_id;
-    if (event_type) match.event_type = event_type;
-    if (from || to) {
-        match.event_timestamp = {};
-        if (from) match.event_timestamp.$gte = new Date(`${from}T00:00:00Z`);   // from: start of that day, UTC
-        if (to) match.event_timestamp.$lte = new Date(`${to}T23:59:59.999Z`);   // to: end of that day, UTC
-    }
-    return match;
 };
 
 // events per dealer, biggest first
@@ -62,10 +63,10 @@ const getByDealer = async (filters: EventFilters) => {
 const LATE_HOURS = 24;
 
 // how many events arrived late, and the average delay between event time and received time
-const getLate = async (match: Record<string, unknown>) => {
+const getLate = async (filters: EventFilters) => {
     const delay = { $subtract: ['$received_at', '$event_timestamp'] };   // milliseconds
     const [row] = await Event.aggregate([
-        { $match: match },
+        { $match: toMatch(filters) },
         {
             $group: {
                 _id: null, //one group for all rows, so we get one row back with the totals
@@ -111,7 +112,8 @@ const getRejected = async (page: number, limit: number, reason?: string) => {
 };
 
 // accepted events, newest first
-const getEvents = async (match: Record<string, unknown>, page: number, limit: number) => {
+const getEvents = async (filters: EventFilters, page: number, limit: number) => {
+    const match = toMatch(filters);
     const [total, events] = await Promise.all([
         Event.countDocuments(match),
         Event.find(match).sort({ event_timestamp: -1, event_id: 1 }).skip((page - 1) * limit).limit(limit).select('-_id -__v').lean(),

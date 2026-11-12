@@ -92,7 +92,7 @@ backend/
     importController.ts   POST /api/import
     eventsController.ts   metrics, quality and the events list
   services/               the logic and the queries, no Express in here
-    importService.ts      read an uploaded file from disk, then validate, deduplicate and save it in chunks, record the run
+    importService.ts      stream an uploaded file from disk, then validate, deduplicate and save it in chunks, record the run
     eventsService.ts      the queries behind the metrics, quality and events endpoints
   middleware/             upload (saves the uploaded file to disk), validate (checks the URL query),
                           errorHandler (errors become responses)
@@ -319,11 +319,19 @@ For one dealer and a week, MongoDB reads about 90 documents instead of all 9,000
 query still takes only a few milliseconds with or without the indexes, so the gain shows when the
 collection grows, not now.
 
-The import parses the whole file at once, but it looks up, checks and saves the rows in chunks of 1,000.
-A generator (`chunks` in `importService.ts`) hands the chunks out one at a time, so each id lookup, each
-duplicate map and each insert is the size of a chunk, not of the file. The parsed array itself is still in
-memory, so memory still grows with the file. Reading the file as a stream, so that it never exists in
-memory as a whole, is the next step for a much bigger file.
+The import reads the file as a stream (`stream-json`), one row at a time, and an async generator
+(`readInChunks` in `importService.ts`) hands out chunks of 1,000 rows. Each chunk is looked up, checked and
+saved before the next one is read, so only one chunk is in memory and the file never exists in memory as a
+whole. Measured on a 130 MB file (400,000 rows, the sample copied 40 times with new ids):
+
+| | Peak backend memory |
+| --- | --- |
+| old way, `readFile` + `JSON.parse` only (before saving anything) | about 583 MB |
+| new way, the whole streamed import (27 s) | about 320 MB |
+| new way, the 10,000-row sample (0.8 s) | about 245 MB |
+
+The old way needed about 4.5 times the file size just to parse it, so a 1 GB file would need several GB.
+The streamed import grows only a little with the file (mostly the database driver and garbage collection).
 
 ## Reliability, logs and input handling
 
@@ -332,10 +340,18 @@ memory as a whole, is the next step for a much bigger file.
   chunks stay saved (their events carry the `file_id` of the failed run, which also shows the counts so
   far). It is safe to restart: run it again. Saved events are loaded first and `event_id` is unique, so the
   second run cannot create duplicates; the rows that were already saved are counted as exact duplicates.
-- **Failures.** An import that fails is saved in `importruns` with `status: failed` and the error message,
-  the endpoint answers with HTTP 500 and the same message, and the error is printed to the console
-  (`import failed: ...`). The server prints a line when it starts, and exits with a message if MongoDB is
-  not reachable. Errors from the endpoints are JSON with a `message`.
+- **Failures.** Every import that starts leaves a run in `importruns`: `completed`, or `failed` with the
+  error message, and the error is printed to the console (`import failed: ...`). A bad file (not JSON, not
+  an array, cut off half way) is a 400 with the reason. Because the file is streamed, a file that breaks in
+  the middle keeps the chunks saved before the break, like any other failure. Anything else (the database)
+  is a 500 that does not show the internal message to the client; the run keeps it. The server prints a
+  line when it starts, and exits with a message if MongoDB is not reachable.
+- **One error path.** Controllers have no try/catch. Expected errors are thrown as `AppError(status, message)`,
+  Express 5 hands every failed async handler to `errorHandler`, and that one place picks the status, logs
+  5xx errors and hides their message. Every endpoint answers errors as `{ error, message }`.
+- **Validation in the routes.** Every route that reads the URL query validates it with `validateQuery`
+  (Joi schemas in `validators/eventFilters.ts`), so a controller only sees clean values. The services build
+  the MongoDB query from those values (`toMatch` in `eventsService.ts`, the only place that does it).
 - **Untrusted input.** The file must be a JSON array, and every row is checked at runtime, because
   TypeScript types say nothing about what is in a JSON file. Query strings are validated and unknown
   parameters are rejected. There are no secrets in the code, only defaults and environment variables.
@@ -381,12 +397,9 @@ Where I stepped in:
 - **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
   quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
   again adds its rows again.
-- **The import still parses the whole file in one piece** after it is saved (`JSON.parse`), so memory grows
-  with the file, although the checking and saving are done in chunks of 1,000 rows (see Performance). An
-  upload is limited to 50 MB, and the browser checks that before sending. Saving to disk is what would let
-  a streaming parser or a background job take over later.
-- **A file that is not valid JSON, or not an array, is a 400.** It is deleted again and is not saved as a
-  failed run, so only imports that started and then failed show up as `failed` in `importruns`.
+- **The import runs inside the upload request.** The browser waits until the whole file is imported. The
+  import itself streams, but the upload is still limited to 50 MB (the browser checks that before sending).
+  For bigger files the next step is to answer 202 at once and let the browser poll the run's status.
 - **Uploaded files are never deleted.** A file stays in `uploads/` exactly when a run with its `file_id`
   exists (also a failed one, so it can be looked at). There is no clean-up job, so the folder grows with
   every import, and uploading the same file twice keeps two copies.
@@ -405,7 +418,7 @@ Where I stepped in:
 
 I am sending this version first to stay inside the time box. I would change these next, in this order:
 
-1. Stream and batch the import, with ids looked up per chunk, to remove the memory growth.
+1. ~~Stream and batch the import~~ (done: see Performance).
 2. Make concurrent imports safe (upsert-based writes or a lock).
 3. Return the dashboard metrics from one aggregation, or pre-computed daily totals if the data grows a lot.
 4. Cursor pagination instead of `skip`.

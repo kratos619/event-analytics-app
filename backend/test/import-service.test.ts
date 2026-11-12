@@ -6,18 +6,15 @@ import { randomUUID } from 'crypto';
 import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
-import { importEvents, chunks } from '../services/importService';
+import { importEvents, readInChunks } from '../services/importService';
 import * as eventsService from '../services/eventsService';
+import { AppError } from '../middleware/errorHandler';
 import { base, ev, writeRows, useTestDb } from './helpers';
 
 useTestDb();
 
-// imports a file made of these rows, as an upload called events-test.json; the test fails if the service answers with an error
-const run = async (rows: unknown, file_id = randomUUID()) => {
-    const out = await importEvents(writeRows(rows), 'events-test.json', file_id);
-    assert.equal(out.error, undefined);
-    return out.result!;
-};
+// imports a file made of these rows, as an upload called events-test.json (a failed import throws, so the test fails)
+const run = (rows: unknown, file_id = randomUUID()) => importEvents(writeRows(rows), 'events-test.json', file_id);
 const counts = (r: any) => ({ total_rows: r.total_rows, accepted: r.accepted, exact: r.exact_duplicates, conflicting: r.conflicting_duplicates, invalid: r.invalid });
 
 describe('a clean file', () => {
@@ -35,8 +32,8 @@ describe('a clean file', () => {
     test('the run uses the file_id and the file name it is given, not the name of the file on disk', async () => {
         const id = randomUUID();
         const out = await importEvents(writeRows([base], 'stored-as-something-else.json'), 'my events (March).json', id);
-        assert.equal(out.result!.run.file_id, id);
-        assert.equal(out.result!.run.file_name, 'my events (March).json');
+        assert.equal(out.run.file_id, id);
+        assert.equal(out.run.file_name, 'my events (March).json');
         const saved = await ImportRun.findOne().lean();
         assert.deepEqual({ file_id: saved!.file_id, file_name: saved!.file_name }, { file_id: id, file_name: 'my events (March).json' });
     });
@@ -178,21 +175,32 @@ describe('when the import cannot finish', () => {
     beforeEach(() => { log = mock.method(console, 'error', () => {}); });   // the service logs failures on purpose
     afterEach(() => log.mock.restore());
 
-    test('a file that is not an array: { error }, nothing saved, no run recorded', async () => {
+    // a bad file is the client's mistake: an AppError(400) with this message
+    const badFile = (message: RegExp) => (e: unknown) => e instanceof AppError && e.statusCode === 400 && message.test(e.message);
+
+    test('a file that is not an array: AppError 400, nothing saved, a failed run with the message', async () => {
         for (const content of [{ events: [base] }, 'text', 5, null, true]) {
-            const out = await importEvents(writeRows(JSON.stringify(content)), 'events-test.json', randomUUID());   // JSON text, not rows
-            assert.deepEqual(out, { error: 'input file must be a JSON array' }, JSON.stringify(content));
+            const file = writeRows(JSON.stringify(content));                  // JSON text, not rows
+            await assert.rejects(importEvents(file, 'events-test.json', randomUUID()), badFile(/^input file must be a JSON array$/), JSON.stringify(content));
         }
-        assert.equal(await ImportRun.countDocuments(), 0);
+        assert.equal(await ImportRun.countDocuments({ status: 'failed', error: 'input file must be a JSON array' }), 5);
         assert.equal(await Event.countDocuments(), 0);
     });
 
-    test('a file that is not JSON: { error } with the parser message, no run recorded', async () => {
-        const out = await importEvents(writeRows('event_id,customer_id\ne1,c1'), 'events.json', randomUUID());
-        assert.match(out.error!, /^input file is not valid JSON: /);
-        assert.equal(out.result, undefined);
-        assert.equal(await ImportRun.countDocuments(), 0);
-        assert.equal(log.mock.callCount(), 0);                                // a client mistake is not logged as a failure
+    test('a file that is not JSON: AppError 400 with the parser message, a failed run', async () => {
+        for (const text of ['event_id,customer_id\ne1,c1', '', '[1] trailing']) {
+            await assert.rejects(importEvents(writeRows(text), 'events.json', randomUUID()), badFile(/^input file is not valid JSON: /), JSON.stringify(text));
+        }
+        assert.equal(await ImportRun.countDocuments({ status: 'failed' }), 3);
+    });
+
+    test('a file that breaks in the middle: the chunks before the break stay saved, the run is failed with the message', async () => {
+        const id = randomUUID();
+        const text = JSON.stringify([base, ev({ event_id: 'e2' }), ev({ event_id: 'e3' })]).slice(0, -20);   // cut off inside row 3
+        await assert.rejects(importEvents(writeRows(text), 'events.json', id, 2), badFile(/^input file is not valid JSON: /));
+        assert.equal(await Event.countDocuments({ file_id: id }), 2);                                       // chunk 1 (rows 1-2) was saved
+        const saved = await ImportRun.findOne().lean();
+        assert.deepEqual({ status: saved!.status, accepted: saved!.accepted, total_rows: saved!.total_rows }, { status: 'failed', accepted: 2, total_rows: 2 });
     });
 
     test('a file that cannot be read: the error is thrown and a failed run is saved', async () => {
@@ -220,30 +228,37 @@ describe('when the import cannot finish', () => {
     });
 });
 
-describe('chunks (the generator that cuts the rows into pieces)', () => {
-    test('pieces of the given size; the last one may be shorter; start is the position of its first row', () => {
-        assert.deepEqual([...chunks([1, 2, 3, 4, 5], 2)], [{ start: 0, rows: [1, 2] }, { start: 2, rows: [3, 4] }, { start: 4, rows: [5] }]);
+describe('readInChunks (reads the file row by row and hands out chunks)', () => {
+    // every chunk the reader hands out for a file made of these rows
+    const readAll = async (rows: unknown, size: number) => {
+        const out = [];
+        for await (const chunk of readInChunks(writeRows(rows), size)) out.push(chunk);
+        return out;
+    };
+
+    test('pieces of the given size; the last one may be shorter; start is the position of its first row', async () => {
+        assert.deepEqual(await readAll([1, 2, 3, 4, 5], 2), [{ start: 0, rows: [1, 2] }, { start: 2, rows: [3, 4] }, { start: 4, rows: [5] }]);
     });
 
-    test('an exact multiple has no empty last piece', () => {
-        assert.deepEqual([...chunks([1, 2, 3, 4], 2)].map((c) => c.rows), [[1, 2], [3, 4]]);
+    test('an exact multiple has no empty last piece', async () => {
+        assert.deepEqual((await readAll([1, 2, 3, 4], 2)).map((c) => c.rows), [[1, 2], [3, 4]]);
     });
 
-    test('a size bigger than the list gives one piece, and an empty list gives none', () => {
-        assert.deepEqual([...chunks([1, 2, 3], 1000)], [{ start: 0, rows: [1, 2, 3] }]);
-        assert.deepEqual([...chunks([], 5)], []);
+    test('a size bigger than the file gives one piece, and an empty array gives none', async () => {
+        assert.deepEqual(await readAll([1, 2, 3], 1000), [{ start: 0, rows: [1, 2, 3] }]);
+        assert.deepEqual(await readAll([], 5), []);
     });
 
-    test('a piece is cut only when it is asked for', () => {
-        const pieces = chunks([1, 2, 3, 4, 5], 2);
-        assert.deepEqual(pieces.next().value, { start: 0, rows: [1, 2] });
-        assert.deepEqual(pieces.next().value, { start: 2, rows: [3, 4] });
-        assert.equal(pieces.next().done, false);                          // one more is waiting
-        assert.equal(pieces.next().done, true);
+    test('a piece is read only when it is asked for', async () => {
+        const pieces = readInChunks(writeRows([1, 2, 3, 4, 5]), 2);
+        assert.deepEqual((await pieces.next()).value, { start: 0, rows: [1, 2] });
+        assert.deepEqual((await pieces.next()).value, { start: 2, rows: [3, 4] });
+        assert.equal((await pieces.next()).done, false);                  // one more is waiting
+        assert.equal((await pieces.next()).done, true);
     });
 
-    test('a size below 1, or not a whole number, is refused (it would loop forever)', () => {
-        for (const size of [0, -1, 1.5, NaN]) assert.throws(() => chunks([1], size).next(), RangeError, String(size));
+    test('a size below 1, or not a whole number, is refused (it would loop forever)', async () => {
+        for (const size of [0, -1, 1.5, NaN]) await assert.rejects(readInChunks(writeRows([1]), size).next(), RangeError, String(size));
     });
 });
 
@@ -277,13 +292,13 @@ describe('processing in chunks', () => {
         for (const size of [1000, 1, 2, 3, 4, 7, 10]) {                       // 10 rows: 1, 2, 5, 10 divide it; 3, 4, 7 leave a short last chunk
             await wipe();
             const out = await importEvents(file, 'events-test.json', randomUUID(), size);
-            assert.deepEqual({ counts: counts(out.result), ...(await snapshot()) }, expected, `chunk size ${size}`);
+            assert.deepEqual({ counts: counts(out), ...(await snapshot()) }, expected, `chunk size ${size}`);
         }
     });
 
     test('a repeat in a LATER chunk is a duplicate of the event an earlier chunk saved; the first copy stays', async () => {
         const result = await importEvents(writeRows([base, ev({ event_type: 'EMAIL_CLICKED' }), base]), 'events-test.json', randomUUID(), 1);
-        assert.deepEqual(counts(result.result), { total_rows: 3, accepted: 1, exact: 1, conflicting: 1, invalid: 0 });
+        assert.deepEqual(counts(result), { total_rows: 3, accepted: 1, exact: 1, conflicting: 1, invalid: 0 });
         assert.equal((await Event.findOne({ event_id: 'e1' }).lean())!.event_type, 'EMAIL_OPENED');
     });
 
@@ -324,7 +339,7 @@ describe('the 10,000-row sample file', () => {
 
     test('summary and reasons', async () => {
         const out = await importSample();
-        assert.deepEqual(counts(out.result), { total_rows: 10000, accepted: 9000, exact: 300, conflicting: 100, invalid: 600 });
+        assert.deepEqual(counts(out), { total_rows: 10000, accepted: 9000, exact: 300, conflicting: 100, invalid: 600 });
         assert.equal(await Event.countDocuments(), 9000);
         assert.equal(await RejectedRecord.countDocuments(), 1000);
         assert.deepEqual((await eventsService.getQuality()).by_reason, [
@@ -339,7 +354,7 @@ describe('the 10,000-row sample file', () => {
         await importSample();
         const again = await importSample();
         // the 9,000 saved rows and the 300 exact repeats are now exact duplicates; conflicts and invalid rows stay what they were
-        assert.deepEqual(counts(again.result), { total_rows: 10000, accepted: 0, exact: 9300, conflicting: 100, invalid: 600 });
+        assert.deepEqual(counts(again), { total_rows: 10000, accepted: 0, exact: 9300, conflicting: 100, invalid: 600 });
         assert.equal(await Event.countDocuments(), 9000);
     });
 });

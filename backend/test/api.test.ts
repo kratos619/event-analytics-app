@@ -100,15 +100,34 @@ describe('import (POST /api/import)', () => {
         test('no body at all', () => rejectedAtTheDoor(call('POST', '/api/import'), /attach a \.json file/));
         test('the file is in another field than "file"', () => rejectedAtTheDoor(upload('[]', 'events.json', 'document'), /./));
         test('a file that is not .json', () => rejectedAtTheDoor(upload('event_id,customer_id\ne1,c1', 'events.csv'), /attach a \.json file/));
-        test('a .json file with text that is not JSON', () => rejectedAtTheDoor(upload('{ not json'), /not valid JSON/));
-        test('a JSON object instead of an array', () => rejectedAtTheDoor(upload('{"events": []}'), /must be a JSON array/));
     });
 
-    test('the database fails while saving: 500, a failed run, and the file is kept', async () => {
+    // the file is read as a stream, so a bad file can only be found out while importing: it gets a failed run, and the file is kept
+    describe('a .json file with bad content is a 400, a failed run with the message, and the file is kept', () => {
+        const badContent = async (text: string, message: RegExp) => {
+            const log = quiet();
+            try {
+                const { status, body } = await upload(text);
+                assert.equal(status, 400);
+                assert.equal(body.error, 'Bad Request');
+                assert.match(body.message, message);
+            } finally { log.mock.restore(); }
+            const run = await ImportRun.findOne().lean();
+            assert.equal(run!.status, 'failed');
+            assert.match(run!.error!, message);
+            assert.equal(await Event.countDocuments(), 0);
+            assert.deepEqual(stored(), [`${run!.file_id}.json`]);
+        };
+
+        test('text that is not JSON', () => badContent('[ not json', /not valid JSON/));
+        test('a JSON object instead of an array', () => badContent('{"events": []}', /must be a JSON array/));
+    });
+
+    test('the database fails while saving: 500 without the internal message, a failed run with it, and the file is kept', async () => {
         const log = quiet();
         const insert = mock.method(Event, 'insertMany', async () => { throw new Error('disk full'); });
         try {
-            assert.deepEqual(await importRows([base]), { status: 500, body: { error: 'Import failed', message: 'disk full' } });
+            assert.deepEqual(await importRows([base]), { status: 500, body: { error: 'Internal Server Error', message: 'Something went wrong' } });
         } finally { insert.mock.restore(); log.mock.restore(); }
         const run = await ImportRun.findOne().lean();
         assert.equal(run!.status, 'failed');
@@ -316,20 +335,20 @@ describe('quality', () => {
 });
 
 describe('when the database fails', () => {
-    test('a handler with its own try/catch answers 500 { error: "Query failed", message }', async () => {
+    // no controller catches errors: every one goes to errorHandler, so every endpoint answers the same way
+    test('every endpoint answers 500, logs the error and does not leak the message', async () => {
+        const routes = ['/api/metrics/by-type', '/api/metrics/daily', '/api/metrics/by-dealer', '/api/metrics/late', '/api/events', '/api/quality', '/api/quality/rejected'];
         const log = quiet();
-        const aggregate = mock.method(Event, 'aggregate', async () => { throw new Error('boom'); });
+        const fail = async () => { throw new Error('boom'); };
+        const mocks = [
+            mock.method(Event, 'aggregate', fail), mock.method(Event, 'countDocuments', fail),
+            mock.method(ImportRun, 'findOne', () => { throw new Error('boom'); }),
+        ];
         try {
-            assert.deepEqual(await get('/api/metrics/by-type'), { status: 500, body: { error: 'Query failed', message: 'boom' } });
-        } finally { aggregate.mock.restore(); log.mock.restore(); }
-    });
-
-    test('a handler on the error middleware answers 500, logs the error and does not leak the message', async () => {
-        const log = quiet();
-        const aggregate = mock.method(Event, 'aggregate', async () => { throw new Error('boom'); });
-        try {
-            assert.deepEqual(await get('/api/metrics/by-dealer'), { status: 500, body: { error: 'Internal Server Error', message: 'Something went wrong' } });
-            assert.equal(log.mock.callCount(), 1);
-        } finally { aggregate.mock.restore(); log.mock.restore(); }
+            for (const route of routes) {
+                assert.deepEqual(await get(route), { status: 500, body: { error: 'Internal Server Error', message: 'Something went wrong' } }, route);
+            }
+            assert.equal(log.mock.callCount(), routes.length);
+        } finally { mocks.forEach((m) => m.mock.restore()); log.mock.restore(); }
     });
 });

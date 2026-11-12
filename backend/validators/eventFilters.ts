@@ -14,3 +14,12 @@ export const eventFiltersSchema = Joi.object({
     from: day,
     to: day,
 }).custom((v, h) => (v.from && v.to && v.from > v.to ? h.message({ custom: '"from" must not be after "to"' }) : v));
+
+// page and page size for the lists. limit is capped so nobody can ask for the whole collection at once
+const paging = {
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20),
+};
+
+export const eventsListSchema = eventFiltersSchema.keys(paging);                    // GET /events: the filters + paging
+export const rejectedListSchema = Joi.object({ ...paging, reason: Joi.string() });  // GET /quality/rejected
