@@ -1,11 +1,25 @@
 # Event Analytics Application
 
-This app imports an events file you pick in the browser (the brief's `events_10000.json`), throws out the bad rows, removes duplicates, stores what is left
-in MongoDB and shows it in a small React dashboard. The point of the exercise is that the numbers on
-the screen are the real ones: no invalid row and no repeated event is counted.
+This app imports events files you pick in the browser (one or several, like the brief's `events_10000.json`),
+throws out the bad rows, removes duplicates, stores what is left in MongoDB and shows it in a small React
+dashboard. The point of the exercise is that the numbers on the screen are the real ones: no invalid row and
+no repeated event is counted.
 
 The backend is Node, Express and TypeScript. The frontend is React and TypeScript. Both are in this repo
 (`backend/` and `frontend/`).
+
+## What changed since the first submission
+
+The first review pointed out three things. This is what I changed for each, and where to see it.
+
+| Feedback | What I changed |
+| --- | --- |
+| Business logic sat in the controllers | Controllers only read the request, call one service and send the answer (`eventsController.ts` is a few lines per endpoint). Query validation moved into the routes (`validateQuery`), the Mongo filter is built in one place in the service (`toMatch`), and no controller has a try/catch: errors go to one `errorHandler` |
+| The import button only re-read a file on the server, one file | You pick one or several `.json` files in the browser. The page uploads them one after another and shows each file's status (waiting, importing, done or failed) and its summary. A bad file fails on its own and the others still import |
+| It worked for the sample, but would it hold up with more data or more users? | The file is streamed in chunks of 1,000 rows instead of read into memory (a 130 MB file: 320 MB peak instead of 583 MB just to parse it). Writes are insert-only, so two imports at the same moment both finish and each event is saved once. Every import is recorded from its start and updated after each chunk; a failed or interrupted import is rolled back, so a retry gives the file's real numbers. The server waits for its indexes at startup (without them, four 10k-row files took 8 s, 23 s, 40 s and 54 s instead of 0.8 s each) |
+
+The test suite now has 160 tests, including two imports racing on the same event, a crash during an import,
+a retry after a failure and the quality screen after a rollback.
 
 ## What the brief asks for
 
@@ -16,13 +30,13 @@ and write down the decisions.
 
 | The brief | Where it is |
 | --- | --- |
-| Import with a summary | `POST /api/import` and the file picker with the Import button |
+| Import with a summary | `POST /api/import` and the file picker (one or several files) with the Import button |
 | Validation, rejected rows kept | `backend/models/Event.ts`, the `rejectedrecords` collection, the quality panel |
 | Deduplication, exact vs conflicting | `backend/services/importService.ts` |
 | Event time vs received time | daily chart (event day), "Late arrivals" card |
 | Second import must not change the totals | see "Importing the same file twice" |
 | At least three metrics | by type, per day, by dealer, plus late arrivals |
-| Filtered API with validation | `backend/controllers/eventsController.ts` |
+| Filtered API with validation | `backend/routes/index.ts` (validation), `backend/validators/eventFilters.ts`, `backend/services/eventsService.ts` |
 | Dashboard | `frontend/` |
 | Tests for the edge cases | `backend/test/` (`import-service.test.ts` for the import, `api.test.ts` for the endpoints) |
 
@@ -41,7 +55,7 @@ cd frontend
 npm install
 npm run dev
 
-# load the data: choose backend/data/events_10000.json with the file picker on the page and press Import, or
+# load the data: on the page, choose backend/data/events_10000.json (or several .json files) and press Import, or
 curl -F 'file=@backend/data/events_10000.json' localhost:3000/api/import
 
 # tests (second terminal, backend folder)
@@ -86,7 +100,7 @@ browser  ->  Vite dev server (5173)  --/api-->  Express (3000)  ->  MongoDB
 
 ```text
 backend/
-  server.ts               express app, routes under /api, MongoDB connection
+  server.ts               express app, routes under /api; at startup: MongoDB, indexes, rolls back interrupted imports
   routes/index.ts         URL to controller
   controllers/            HTTP only: read the request, call a service, send the answer
     importController.ts   POST /api/import
@@ -114,7 +128,7 @@ frontend/
 | --- | --- |
 | `events` | `event_id` (unique), `customer_id`, `dealer_id`, `event_type`, `event_timestamp`, `received_at`, `lead_created_at` (these three are dates), `campaign_id`, `segment`, `email_provider`, `lead_status`, `file_id` (the upload that first saved it) |
 | `rejectedrecords` | `file_id` (the upload it was rejected in), `row_number` (1-based position in that file), `reason`, `raw` (the original row as it came), `createdAt`, `updatedAt` |
-| `importruns` | `file_id` (one per upload, copied onto its events and rejected rows), `file_name`, `status` (`completed` or `failed`), `total_rows`, `accepted`, `exact_duplicates`, `conflicting_duplicates`, `invalid`, `duration_ms`, `error`, `createdAt` |
+| `importruns` | `file_id` (one per upload, copied onto its events and rejected rows), `file_name`, `status` (`running`, `completed` or `failed`), `total_rows`, `accepted`, `exact_duplicates`, `conflicting_duplicates`, `invalid` (updated after every chunk), `duration_ms`, `error`, `rolled_back`, `createdAt` |
 
 ### Indexes and what uses them
 
@@ -203,29 +217,29 @@ missing. Extra keys in a row are ignored.
 
 **Event time and received time.**
 A day always means the UTC day of `event_timestamp`. An event is late when `received_at` is more than
-24 hours after `event_timestamp` (a constant in `eventsController.ts`). A late event is valid and counts
+24 hours after `event_timestamp` (`LATE_HOURS` in `eventsService.ts`). A late event is valid and counts
 on the day it happened. Test 5 sends the later event first in the file and checks that nothing lands on
 the day it arrived.
 
-**`insertMany`, not `bulkWrite`.**
-After the loop, `goodEntries` holds only events that are new, so the write is plain inserts. I tried
-`bulkWrite` with upserts as well. It never fails on an id that already exists, which is better when two
-imports run at the same time, but it was slower here (about 0.55 s against 0.4 s for the first import)
-and harder to read, so I kept `insertMany`. The cost is in "What is not great" below.
-
 **Three small metric endpoints.**
 By type, per day and by dealer do almost the same thing (filter, group, count). I kept them as separate
-endpoints because the brief names three metrics and each one is easy to read. They share one function
-that turns the query string into a Mongo filter and rejects bad values with a 400.
-One combined endpoint is possible and is on the list below.
+endpoints because the brief names three metrics and each one is easy to read. The route checks the query
+string (bad values are a 400 before the controller runs), and one function in the service (`toMatch`) turns
+the clean filters into a Mongo `$match`. One combined endpoint is possible and is on the list below.
 
 **Backend layout.**
-Routes call controllers, controllers call services, services use the models. A controller only reads
-the request and sends the answer. The import lives in `importService.ts` and the read queries in
-`eventsService.ts`, so both can be tested without HTTP. `GET /api/metrics/by-dealer` is written in the
-final shape (the route validates the query with middleware, the controller has no try/catch, and
-`errorHandler` turns errors into responses). The other handlers still validate and catch errors in the
-controller and can be moved the same way.
+Routes call controllers, controllers call services, services use the models. A route validates the query
+with middleware. A controller only reads the validated input, calls one service and sends the answer; it
+has no try/catch, because Express 5 hands every failed async handler to `errorHandler`, the one place that
+turns errors into responses. The import lives in `importService.ts` and the read queries in
+`eventsService.ts`, so both are tested without HTTP.
+
+**Several files: one request per file, from the browser.**
+The picker takes several files, and the page sends them one per request, waiting for each answer before
+the next. So the backend stays a plain single-file upload, every request is short (one file, at most 50 MB),
+the user sees each file's status and summary as it finishes, and the files go in the order picked, so "the
+first valid row wins" follows that order. One request with all the files would only show one spinner and
+then everything at once, and its time would grow with the number of files.
 
 **Tests use Node's built-in runner.**
 `node --test` through `tsx`, so there is no extra test dependency. The files run one after another
@@ -240,7 +254,9 @@ with `test` in it. There are five files:
   brief (a valid event, a missing id or bad timestamp, an exact and a conflicting duplicate, a second
   import) plus `file_id`, failed imports and the real 10,000-row file. The file is imported in chunks of
   1,000 rows, and there are tests that the result is the same for chunk sizes from 1 to 1000, that a repeat
-  in a later chunk is still a duplicate, and that row numbers stay file-wide.
+  in a later chunk is still a duplicate, and that row numbers stay file-wide. Also: two imports racing on
+  the same event, the run's progress after every chunk, rollback after a failure, recovery after a crash,
+  and a retry that gives the same numbers as a first import.
 - `api.test.ts`: the endpoints over HTTP, the upload (the file is saved to disk with the content that was
   sent), the 400 on every filtered route, and the 500 paths. It uses its own upload folder (`UPLOAD_DIR`).
 
@@ -285,21 +301,19 @@ Where the brief left something open, this is what I assumed.
   23:59:59.999).
 - A dealer is a tenant. The dealer filter is an exact match on `dealer_id` in every metric and in the events
   list, so a filtered view never contains another dealer's events.
-- The import reads one file at a fixed path on the server. "Import" means "read that file again". There is
-  no upload.
 - A missing earlier event, such as an open with no send, is not an error, and no rate is shown.
 
 ## API
 
 | Endpoint | Returns |
 | --- | --- |
-| `POST /api/import` | a form with the events file in the field `file` (a `.json` file holding an array, up to 50 MB). The file is saved to `uploads/` as `<file_id>.json`, then imported from there. Returns the summary and the saved run |
+| `POST /api/import` | a form with one events file in the field `file` (a `.json` file holding an array, up to 50 MB). The file is saved to `uploads/` as `<file_id>.json`, then imported from there. Returns the summary and the saved run. A bad file is a 400 with the reason (and a failed run). For several files the page sends one request per file |
 | `GET /api/metrics/by-type` | accepted events per event type |
 | `GET /api/metrics/daily` | accepted events per UTC event day |
 | `GET /api/metrics/by-dealer` | accepted events per dealer, biggest first |
 | `GET /api/metrics/late` | accepted total, late count, average delay in minutes |
-| `GET /api/quality` | the last import and the number of its rejected rows per reason |
-| `GET /api/quality/rejected` | rows the last import did not save, with their original data |
+| `GET /api/quality` | the latest completed import (`last_import`), the number of its rejected rows per reason, and a newer import that failed, if any (`last_failed`) |
+| `GET /api/quality/rejected` | rows the latest completed import did not save, with their original data |
 | `GET /api/events` | accepted events, newest first |
 | `GET /health` | `{ "ok": true }` |
 
@@ -326,11 +340,13 @@ Measured on my laptop with MongoDB running locally, on the supplied file (3.9 MB
 
 | | Time | Backend memory |
 | --- | --- | --- |
-| first import, 9,000 events inserted | about 0.4 s | about 208 MB at the peak (116 MB idle) |
-| same file again | about 0.4 s | about 300 MB at the peak |
+| first import, 9,000 events inserted | about 0.8 s | about 180–245 MB at the peak |
+| same file again (nothing new, 10,000 rejected rows) | about 0.7 s | about the same |
+| four 10k-row files picked together | about 0.7–0.95 s each | about the same |
 
-The second import peaks higher because it loads the 9,000 saved events and writes 10,000 rejected rows.
-The memory figures are the process size sampled while the import ran, so treat them as rough.
+The memory figures are the process size sampled while the import ran, so treat them as rough. The first
+version took about 0.4 s: it read the whole file with `JSON.parse`, which is faster than the streaming
+parser but needs the whole file in memory (see below). I chose bounded memory over that 0.4 s.
 
 Indexes: unique on `event_id`, plus `(dealer_id, event_timestamp)` and `event_timestamp` for the filters.
 For one dealer and a week, MongoDB reads about 90 documents instead of all 9,000. On this much data every
@@ -353,6 +369,20 @@ the sample both ways, 28 s instead of 27 s for the 130 MB file.
 
 The old way needed about 4.5 times the file size just to parse it, so a 1 GB file would need several GB.
 The streamed import grows only a little with the file (mostly the database driver and garbage collection).
+
+**The main bottleneck at larger scale.** The import runs at about 12,000–14,000 rows per second (400,000 rows
+in 28 s), and almost all of that time is the database: per chunk one lookup, one `bulkWrite` and one insert
+of rejected rows. So:
+
+- **Writes.** A million rows is about 80 s inside one HTTP request, one file at a time. The next step would
+  be to upload to object storage, answer 202 at once, and import in background workers from a queue, with
+  progress read from the run (polling or server-sent events). Several workers on different files are already
+  safe, because writes are insert-only on a unique `event_id`.
+- **Reads.** Every dashboard request aggregates over all matching events. With millions of events that
+  becomes the slow part, so I would keep pre-computed daily counts per dealer and type (updated by the
+  import) and read the charts from those, with a short cache in front.
+- **One database.** Past one machine, the events would be sharded, by `event_id` for the unique check or by
+  `dealer_id` for the dashboard queries, which is a trade-off to decide with the access patterns.
 
 ## Reliability, logs and input handling
 
@@ -386,7 +416,8 @@ The streamed import grows only a little with the file (mostly the database drive
 ## AI development note
 
 I used Claude Code (Claude Sonnet 5.5) as a pair programmer, in the terminal and in VS Code. For a last
-review of the finished project I used Claude (Opus 5.5) in the Claude app.
+review of the finished project I used Claude (Opus 5.5) in the Claude app. For the changes after the first
+review I used Claude Code (Claude Opus 5.5) in VS Code.
 
 What it did: most of the code started as suggestions from Claude in chat (the validation, the import,
 the metric queries, the React components and the tests). I typed or approved every file, ran it, and
@@ -402,8 +433,9 @@ Where I stepped in:
 
 - The first version of the import was about 80 lines with batching, `bulkWrite` and several helper
   functions. I asked for something I could read and explain, and it was rebuilt as one loop with a `Map`.
-- It started with a service layer and several extra controller files. I removed them and kept plain
-  routes, controllers and models.
+- It started with a service layer and several extra controller files. In the first submission I removed
+  them to keep the code small, and the logic ended up in the controllers. The review showed that was the
+  wrong call, so the service layer is back (see "What changed since the first submission").
 - Its first frontend API file used generics and `Promise.all`. I asked for the plain style I use in my
   own React projects (`fetch`, check `ok`, return the JSON), and it was rewritten that way. Later I put
   `Promise.all` back in `App.tsx`, because loading the four metrics one after another was slower.
@@ -416,6 +448,25 @@ Where I stepped in:
 - It added its own name as co-author on my commits, and the e-mail it set up for them was linked on
   GitHub to a different account. I removed that line and rewrote the commits with my own GitHub no-reply
   address.
+
+After the first review, I asked for every change to be explained with an example of the old and the new
+behaviour before any code was written, and I decided on each one. What I checked: all 160 tests on Node 20
+and 24, the 10,000-row numbers after every change, the dashboard in the browser, and the import under
+failure (a 100,000-row upload with the server killed half way, then restarted). Where I stepped in:
+
+- It proposed answering the upload with 202, a queue, and the browser asking for the status every second.
+  For files that import in under a second that is machinery without a benefit, and the brief makes live
+  progress optional, so I said no. The same goes for sockets. It is written down as the next step for
+  big files instead.
+- It proposed sending several files in one request. I wanted the backend to stay a plain single-file
+  upload, so the browser sends the files one by one and shows each file's status.
+- While testing I dropped the database with the server running, and four 10k-row files took 8 s, 23 s,
+  40 s and 54 s. `explain()` showed a full collection scan: the indexes had gone with the collections. Its
+  first fix created the indexes before every import. I asked for the conventional place instead: the server
+  creates them at startup, waits for them, and stops if one cannot be built.
+- I killed the server during an import and the quality screen then showed a failed import's counts above an
+  empty table: its change that rolls back failed imports had removed the rows the screen was listing. The
+  screen now shows the latest completed import, with a warning about the newer failed one.
 
 ## What is not great
 
@@ -437,8 +488,8 @@ Where I stepped in:
 - **Uploaded files are never deleted.** A file stays in `uploads/` exactly when a run with its `file_id`
   exists (also a failed one, so it can be looked at). There is no clean-up job, so the folder grows with
   every import, and uploading the same file twice keeps two copies.
-- **Only `.json` files are accepted**, one per request. Other formats such as CSV would need a parser step
-  before the import.
+- **Only `.json` files are accepted**, one per request (the page sends several one after another). Other
+  formats such as CSV would need a parser step before the import.
 - **Some browsers and tools send a file name that multer reads wrongly** (it decodes names as latin1). The
   controller converts it back to UTF-8, which is what browsers send.
 - **Pagination uses `skip`**, which gets slow on very deep pages.
