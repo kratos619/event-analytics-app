@@ -170,6 +170,15 @@ rejected rows, because every row is either invalid or already known. The quality
 import only, found by its `file_id`.
 The unique index on `event_id` is the safety net underneath.
 
+**Insert-only writes, so two imports at the same moment are safe.**
+The lookup above is a snapshot: another import can save the same event between our lookup and our write
+(a check-then-act race). So new events are written with `bulkWrite` + `updateOne({ event_id }, { $setOnInsert:
+event }, { upsert: true })`: "insert it only if it is still not saved". MongoDB tells us which ones it really
+inserted (`upsertedIds`). A row that was not inserted lost the race, so it is compared with the saved copy and
+recorded as an exact or conflicting duplicate. Both imports finish, the first copy is never overwritten
+(`$setOnInsert` only writes on insert, never `$set`), and every row is still counted once. The tests under
+"two imports at the same moment" fail with `E11000 duplicate key error` on the old `insertMany` version.
+
 **Validation with Joi, in the model file.**
 The Joi schema sits under the Mongoose schema in `models/Event.ts`, and `validateEvent(row)` returns
 either the clean event or one reason code. The fields are checked in the order of the brief's table and
@@ -327,8 +336,11 @@ whole. Measured on a 130 MB file (400,000 rows, the sample copied 40 times with 
 | | Peak backend memory |
 | --- | --- |
 | old way, `readFile` + `JSON.parse` only (before saving anything) | about 583 MB |
-| new way, the whole streamed import (27 s) | about 320 MB |
-| new way, the 10,000-row sample (0.8 s) | about 245 MB |
+| new way, the whole streamed import (28 s) | about 320 MB |
+| new way, the 10,000-row sample (0.8 s) | about 180–245 MB (varies between runs) |
+
+Insert-only writes (`bulkWrite` with upserts, see Decisions) cost about the same as `insertMany`: 0.8 s for
+the sample both ways, 28 s instead of 27 s for the 130 MB file.
 
 The old way needed about 4.5 times the file size just to parse it, so a 1 GB file would need several GB.
 The streamed import grows only a little with the file (mostly the database driver and garbage collection).
@@ -392,8 +404,8 @@ Where I stepped in:
 
 ## What is not great
 
-- **Two imports at the same moment.** The unique index stops duplicates, but one of the two fails with a
-  duplicate key error and has to be run again. The import is safe to restart, it is not atomic.
+- **Two imports at the same moment work on one database.** Both finish and each event is saved once (see
+  Decisions), but which import "wins" an event depends on which one writes first, not on upload order.
 - **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
   quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
   again adds its rows again.
@@ -419,7 +431,7 @@ Where I stepped in:
 I am sending this version first to stay inside the time box. I would change these next, in this order:
 
 1. ~~Stream and batch the import~~ (done: see Performance).
-2. Make concurrent imports safe (upsert-based writes or a lock).
+2. ~~Make concurrent imports safe~~ (done: insert-only writes, see Decisions).
 3. Return the dashboard metrics from one aggregation, or pre-computed daily totals if the data grows a lot.
 4. Cursor pagination instead of `skip`.
 5. Frontend: labels, proper types, a few UI tests.

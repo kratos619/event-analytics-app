@@ -9,7 +9,7 @@ import ImportRun from '../models/ImportRun';
 import { importEvents, readInChunks } from '../services/importService';
 import * as eventsService from '../services/eventsService';
 import { AppError } from '../middleware/errorHandler';
-import { base, ev, writeRows, useTestDb } from './helpers';
+import { base, ev, seed, writeRows, useTestDb } from './helpers';
 
 useTestDb();
 
@@ -129,6 +129,48 @@ describe('events that are already saved', () => {
     });
 });
 
+describe('two imports at the same moment', () => {
+    // the race: our lookup said "e1 is not saved", then another import saved e1 before our write
+    const lookupSeesNothing = () => {
+        const find = mock.method(Event, 'find');
+        find.mock.mockImplementationOnce((() => ({ lean: async () => [] })) as any);   // only the first lookup is fooled
+        return find;
+    };
+
+    test('the import that loses the race does not fail: its row is a conflict, the first copy stays', async () => {
+        await seed([base]);                                                  // the other import saved e1 (segment NewCar)
+        const find = lookupSeesNothing();
+        let result;
+        try {
+            result = await run([ev({ segment: 'Used' }), ev({ event_id: 'e9' })]);
+        } finally { find.mock.restore(); }
+
+        assert.deepEqual(counts(result), { total_rows: 2, accepted: 1, exact: 0, conflicting: 1, invalid: 0 });
+        assert.equal((await Event.findOne({ event_id: 'e1' }).lean())!.segment, 'NewCar');   // not overwritten
+        assert.ok(await Event.exists({ event_id: 'e9' }));                                    // the new event is still saved
+        const rejected = await RejectedRecord.findOne().lean();
+        assert.deepEqual([rejected!.row_number, rejected!.reason], [1, 'CONFLICTING_DUPLICATE']);
+    });
+
+    test('the same row losing the race is an exact duplicate', async () => {
+        await seed([base]);
+        const find = lookupSeesNothing();
+        let result;
+        try {
+            result = await run([base]);
+        } finally { find.mock.restore(); }
+        assert.deepEqual(counts(result), { total_rows: 1, accepted: 0, exact: 1, conflicting: 0, invalid: 0 });
+    });
+
+    test('really at the same time: both finish, every event is saved once, and each run adds up', async () => {
+        const rows = Array.from({ length: 50 }, (_, n) => ev({ event_id: `e${n}` }));
+        const [a, b] = await Promise.all([run(rows), run(rows)]);
+        assert.equal(await Event.countDocuments(), 50);
+        assert.equal(a.accepted + b.accepted, 50);                           // each event was accepted by exactly one import
+        for (const r of [a, b]) assert.equal(r.accepted + r.exact_duplicates + r.conflicting_duplicates + r.invalid, 50);
+    });
+});
+
 describe('file_id: one per import, on the run, its events and its rejected rows', () => {
     // getRejected logs its filter; keep the test output clean
     let log: any;
@@ -216,7 +258,7 @@ describe('when the import cannot finish', () => {
 
     test('the database fails while saving: a failed run with that error and the file name, and no completed run', async () => {
         const id = randomUUID();
-        const insert = mock.method(Event, 'insertMany', async () => { throw new Error('disk full'); });
+        const insert = mock.method(Event, 'bulkWrite', async () => { throw new Error('disk full'); });
         try {
             await assert.rejects(importEvents(writeRows([base, ev({ event_id: '' })]), 'events-test.json', id), /disk full/);
         } finally { insert.mock.restore(); }
@@ -317,9 +359,9 @@ describe('processing in chunks', () => {
 
     test('a failure in a later chunk: earlier chunks stay saved, and the failed run shows how far it got', async () => {
         const log = mock.method(console, 'error', () => {});
-        const realInsert = Event.insertMany.bind(Event) as any;
+        const realWrite = Event.bulkWrite.bind(Event) as any;
         let calls = 0;
-        const insert = mock.method(Event, 'insertMany', async (docs: any) => { if (++calls === 2) throw new Error('disk full'); return realInsert(docs); });
+        const insert = mock.method(Event, 'bulkWrite', async (ops: any) => { if (++calls === 2) throw new Error('disk full'); return realWrite(ops); });
         const id = randomUUID();
         const six = [1, 2, 3, 4, 5, 6].map((n) => ev({ event_id: `e${n}` }));
         try {

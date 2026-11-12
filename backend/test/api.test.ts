@@ -125,7 +125,7 @@ describe('import (POST /api/import)', () => {
 
     test('the database fails while saving: 500 without the internal message, a failed run with it, and the file is kept', async () => {
         const log = quiet();
-        const insert = mock.method(Event, 'insertMany', async () => { throw new Error('disk full'); });
+        const insert = mock.method(Event, 'bulkWrite', async () => { throw new Error('disk full'); });
         try {
             assert.deepEqual(await importRows([base]), { status: 500, body: { error: 'Internal Server Error', message: 'Something went wrong' } });
         } finally { insert.mock.restore(); log.mock.restore(); }

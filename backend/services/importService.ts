@@ -47,10 +47,26 @@ async function* readInChunks(filePath: string, size: number) {
 
 type Counts = { accepted: number; exact: number; conflicting: number; invalid: number };
 
+// saves the new events of a chunk, insert-only: "insert e1 only if e1 is not saved yet".
+// If another import saved e1 a moment ago, MongoDB leaves that copy alone ($setOnInsert never overwrites) instead
+// of failing with a duplicate key error. Returns the positions of the events that were really inserted
+const saveNewEvents = async (events: any[], file_id: string) => {
+    if (events.length === 0) return new Set<number>();
+    const result = await Event.bulkWrite(events.map((event) => ({
+        updateOne: {
+            filter: { event_id: event.event_id },
+            update: { $setOnInsert: { ...event, file_id } },
+            upsert: true,
+        },
+    })));
+    // upsertedIds = { position: id } for every insert, e.g. { 0: ..., 2: ... }
+    return new Set(Object.keys(result.upsertedIds).map(Number));
+};
+
 // looks up, checks and saves ONE chunk of rows. Events saved by earlier chunks (or earlier imports) are found by the
 // lookup, so a repeat in a later chunk is still a duplicate and the first copy still wins
 const processChunk = async (rows: any[], start: number, file_id: string): Promise<Counts> => {
-    const goodEntries: any[] = [];
+    const goodEntries: { row_number: number; raw: any; event: any }[] = [];
     const rejectedEntries: { row_number: number; reason: string; raw: any }[] = [];
 
     // events of this chunk that are already saved (one query): we treat them as "seen before"
@@ -67,7 +83,7 @@ const processChunk = async (rows: any[], start: number, file_id: string): Promis
             const { event_id, ...rest } = result.value;
             if (!uniqueEntries.has(event_id)) {
                 uniqueEntries.set(event_id, rest);
-                goodEntries.push(result.value);
+                goodEntries.push({ row_number, raw: rows[i], event: result.value });
             } else if (isSame(uniqueEntries.get(event_id), rest)) {
                 rejectedEntries.push({ row_number, reason: 'EXACT_DUPLICATE', raw: rows[i] }); // same fields -> exact duplicate,
             } else {
@@ -76,13 +92,27 @@ const processChunk = async (rows: any[], start: number, file_id: string): Promis
         }
     }
 
+    const inserted = await saveNewEvents(goodEntries.map((g) => g.event), file_id);
+
+    // Our lookup above is a snapshot. If another import saved the same event between our lookup and our write,
+    // that event was not inserted: it lost the race, so it is a duplicate of the saved copy. Compare with that copy.
+    const lost = goodEntries.filter((_, i) => !inserted.has(i));
+    if (lost.length > 0) {
+        const stored = await Event.find({ event_id: { $in: lost.map((g) => g.event.event_id) } }).lean();
+        const storedById = new Map(stored.map((e) => [e.event_id, e]));
+        for (const g of lost) {
+            const reason = isSame(storedById.get(g.event.event_id), g.event) ? 'EXACT_DUPLICATE' : 'CONFLICTING_DUPLICATE';
+            rejectedEntries.push({ row_number: g.row_number, reason, raw: g.raw });
+        }
+    }
+
+    // counted after the write, because a row that lost the race became a duplicate
     const exact = rejectedEntries.filter((r) => r.reason === 'EXACT_DUPLICATE').length;
     const conflicting = rejectedEntries.filter((r) => r.reason === 'CONFLICTING_DUPLICATE').length;
     const invalid = rejectedEntries.length - exact - conflicting;
 
-    await Event.insertMany(goodEntries.map((e) => ({ ...e, file_id })));              // every row of this upload carries the same file_id
-    await RejectedRecord.insertMany(rejectedEntries.map((r) => ({ ...r, file_id })));   // rejectedEntries are unique, so one bulk insert
-    return { accepted: goodEntries.length, exact, conflicting, invalid };
+    await RejectedRecord.insertMany(rejectedEntries.map((r) => ({ ...r, file_id })));   // every row of this upload carries the same file_id
+    return { accepted: inserted.size, exact, conflicting, invalid };
 };
 
 // streams an uploaded file from disk (filePath), saves its new events chunk by chunk, keeps the rejected rows and records the run.
