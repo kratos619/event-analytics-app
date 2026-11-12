@@ -12,6 +12,7 @@ const importRunSchema = new Schema(
     invalid:                { type: Number, default: 0 },
     duration_ms:            { type: Number },              // set when the run ends
     error:                  { type: String },              // set when the run fails
+    rolled_back:            { type: Boolean, default: false },  // true when a failed run's events and rejected rows were removed
   },
   { timestamps: true }                                     // createdAt = when the import started
 );

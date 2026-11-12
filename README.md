@@ -174,7 +174,9 @@ to say whether repeated rows are recorded again. My choice: every import gets it
 its own summary to `importruns`, and its rejected rows (exact duplicates included) are saved in
 `rejectedrecords` with the same `file_id`. Nothing is deleted, so a second import adds another 10,000
 rejected rows, because every row is either invalid or already known. The quality screen shows the latest
-import only, found by its `file_id`.
+**completed** import only, found by its `file_id`. A failed import is rolled back (its rejected rows are gone),
+so if a newer import failed, the screen shows a warning with its error and how far it got, above the numbers
+of the last completed one, instead of counts whose rows no longer exist.
 The unique index on `event_id` is the safety net underneath.
 
 **Insert-only writes, so two imports at the same moment are safe.**
@@ -354,17 +356,23 @@ The streamed import grows only a little with the file (mostly the database drive
 
 ## Reliability, logs and input handling
 
-- **Atomic or resumable?** Neither. The import is not one transaction and it does not continue from where
-  it stopped. Each chunk of 1,000 rows is saved on its own, so if an import fails half way the earlier
-  chunks stay saved (their events carry the `file_id` of the failed run, which also shows the counts so
-  far). It is safe to restart: run it again. Saved events are loaded first and `event_id` is unique, so the
-  second run cannot create duplicates; the rows that were already saved are counted as exact duplicates.
+- **Atomic or resumable? Each file is all-or-nothing (atomic by rollback), and safe to restart.** The run is
+  created first (`running`) and its counts are saved after every chunk, so the database always shows how far
+  an import got. If the import fails (bad file half way, database error), everything it saved is removed by
+  its `file_id` and the run is marked `failed` with `rolled_back: true` and the counts it reached. If the
+  server dies during an import (Ctrl+C, crash, restart), no catch block runs; at the next start every run
+  still `running` is rolled back the same way and marked `failed: interrupted`. A retry is then a clean
+  import with the file's real numbers, and no half-import is left in the totals or the rejected rows.
+  Tested for real: a 100,000-row upload killed after 2 s left a `running` run at 25,000 rows and 22,501
+  events (one event of chunk 26 was written before the kill); the next start removed them, and the
+  re-upload gave 90,000 / 3,000 / 1,000 / 6,000. Not a MongoDB transaction: that needs a replica set and a
+  whole file is too big for one. Not resumable: a retry starts from row 1, which is about a second for these
+  files (see "What I want to improve next" for resume).
 - **Failures.** Every import that starts leaves a run in `importruns`: `completed`, or `failed` with the
-  error message, and the error is printed to the console (`import failed: ...`). A bad file (not JSON, not
-  an array, cut off half way) is a 400 with the reason. Because the file is streamed, a file that breaks in
-  the middle keeps the chunks saved before the break, like any other failure. Anything else (the database)
-  is a 500 that does not show the internal message to the client; the run keeps it. The server prints a
-  line when it starts, and exits with a message if MongoDB is not reachable.
+  error message, and the error is printed to the console (`import failed, rolled back: ...`). A bad file
+  (not JSON, not an array, cut off half way) is a 400 with the reason. Anything else (the database) is a 500
+  that does not show the internal message to the client; the run keeps it. The server prints a line when it
+  starts, and exits with a message if MongoDB is not reachable or an index cannot be built.
 - **One error path.** Controllers have no try/catch. Expected errors are thrown as `AppError(status, message)`,
   Express 5 hands every failed async handler to `errorHandler`, and that one place picks the status, logs
   5xx errors and hides their message. Every endpoint answers errors as `{ error, message }`.
@@ -413,6 +421,13 @@ Where I stepped in:
 
 - **Two imports at the same moment work on one database.** Both finish and each event is saved once (see
   Decisions), but which import "wins" an event depends on which one writes first, not on upload order.
+- **A rolled-back import was briefly visible.** While a file imports, its events already count on the
+  dashboard; if it then fails, they disappear again. If another import ran at that same moment and saw them
+  as duplicates, those rows stay recorded as duplicates of events that are now gone. A large system would
+  import into a staging area first and publish when the file is complete.
+- **Crash recovery assumes one server.** At startup every `running` run is treated as cut off. With several
+  servers, each run would need the id of its server (or a heartbeat), so one server does not roll back
+  another server's live import.
 - **`rejectedrecords` grows with every import.** Each row carries the `file_id` of its upload and the
   quality screen reads only the latest one, but old rows are never cleaned up. Uploading the same file
   again adds its rows again.
@@ -442,5 +457,8 @@ I am sending this version first to stay inside the time box. I would change thes
 3. Return the dashboard metrics from one aggregation, or pre-computed daily totals if the data grows a lot.
 4. Cursor pagination instead of `skip`.
 5. Frontend: labels, proper types, a few UI tests.
+6. Resume instead of starting again, for very big files: the run already keeps how far it got after every
+   chunk, and the uploaded file stays on disk. Resume would remove only what the half-finished chunk saved
+   (events would store the row they came from), then continue from the last finished chunk.
 
 

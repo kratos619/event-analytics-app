@@ -150,7 +150,7 @@ const reject = (file_id: string, reason: string, row_number: number, raw: unknow
 
 describe('getQuality', () => {
     test('before any import: no last import and no reasons', async () => {
-        assert.deepEqual(await service.getQuality(), { last_import: null, by_reason: [] });
+        assert.deepEqual(await service.getQuality(), { last_import: null, last_failed: null, by_reason: [] });
     });
 
     test('shows the newest import and counts only ITS rejected rows', async () => {
@@ -181,12 +181,30 @@ describe('getQuality', () => {
         assert.deepEqual((await service.getQuality()).by_reason, []);
     });
 
-    test('a failed import is the last import too', async () => {
+    test('a newer import that failed (rolled back): the screen keeps the last completed one, and reports the failure', async () => {
         await importRun('A', '2026-09-01T00:00:00Z');
-        await importRun('B', '2026-09-02T00:00:00Z', { status: 'failed', error: 'boom' });
+        await reject('A', 'MISSING_EVENT_ID', 1);
+        await importRun('B', '2026-09-02T00:00:00Z', { status: 'failed', error: 'interrupted', rolled_back: true });
         const quality: any = await service.getQuality();
-        assert.equal(quality.last_import.status, 'failed');
-        assert.equal(quality.last_import.error, 'boom');
+        assert.equal(quality.last_import.file_id, 'A');
+        assert.deepEqual(quality.by_reason, [{ reason: 'MISSING_EVENT_ID', count: 1 }]);   // A's rows, not the empty list of B
+        assert.deepEqual([quality.last_failed.file_id, quality.last_failed.error], ['B', 'interrupted']);
+        assert.equal((await service.getRejected(1, 20)).total, 1);                         // the table shows A's rows too
+    });
+
+    test('a failure OLDER than the last completed import is not reported', async () => {
+        await importRun('A', '2026-09-01T00:00:00Z', { status: 'failed', error: 'boom' });
+        await importRun('B', '2026-09-02T00:00:00Z');
+        const quality: any = await service.getQuality();
+        assert.equal(quality.last_import.file_id, 'B');
+        assert.equal(quality.last_failed, null);
+    });
+
+    test('only failed imports so far: no last import, but the failure is reported', async () => {
+        await importRun('A', '2026-09-01T00:00:00Z', { status: 'failed', error: 'boom' });
+        const quality: any = await service.getQuality();
+        assert.equal(quality.last_import, null);
+        assert.equal(quality.last_failed.error, 'boom');
     });
 
     test('data saved before file_id existed (no file_id anywhere) still works', async () => {

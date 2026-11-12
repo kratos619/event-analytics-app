@@ -41,16 +41,29 @@ const QualityPanel = ({ refresh }: { refresh: number }) => {
 
     if (error) return <div className="alert alert-danger">Could not load the data quality: {error}</div>
     if (!quality || !rows) return <div className="spinner-border" role="status" />
-    if (!quality.last_import) return <div className="alert alert-info">No import yet, so there is nothing to check.</div>
 
-    const run = quality.last_import
+    // a newer import that failed: everything it saved was rolled back, so it only gets a warning
+    const failed = quality.last_failed
+    const warning = failed && (
+        <div className="alert alert-warning">
+            The latest import, {failed.file_name}, failed ({failed.error}) after {failed.total_rows.toLocaleString()} rows.
+            {failed.rolled_back && ' Everything it saved was rolled back.'}
+        </div>
+    )
+
+    if (!quality.last_import) {
+        return warning || <div className="alert alert-info">No import yet, so there is nothing to check.</div>
+    }
+
+    const run = quality.last_import   // the latest COMPLETED import: its rejected rows are the ones in the database
     const all = quality.by_reason.reduce((sum: number, r: any) => sum + r.count, 0)
     const pages = Math.max(1, Math.ceil(rows.total / LIMIT))
 
     return (
         <div className="card mb-4">
             <div className="card-body">
-                <h2 className="h6">Data quality (last import: {run.status}, {run.total_rows.toLocaleString()} rows read)</h2>
+                {warning}
+                <h2 className="h6">Data quality ({run.file_name}: {run.status}, {run.total_rows.toLocaleString()} rows read)</h2>
                 <div className="row g-3 mb-3">
                     <div className="col-4"><div className="fs-4 fw-semibold">{run.invalid.toLocaleString()}</div><div className="text-muted small">invalid rows</div></div>
                     <div className="col-4"><div className="fs-4 fw-semibold">{run.exact_duplicates.toLocaleString()}</div><div className="text-muted small">exact duplicates</div></div>

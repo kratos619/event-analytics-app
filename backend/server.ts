@@ -5,6 +5,7 @@ import { errorHandler } from './middleware/errorHandler';
 import Event from './models/Event';
 import RejectedRecord from './models/RejectedRecord';
 import ImportRun from './models/ImportRun';
+import { recoverInterruptedImports } from './services/importService';
 
 const app = express();
 app.use(express.json());                                        // read JSON request bodies
@@ -22,6 +23,11 @@ const PORT = process.env.PORT ?? 3000;
 mongoose
     .connect(MONGO_URL)
     .then(() => Promise.all([Event.init(), RejectedRecord.init(), ImportRun.init()]))
+    .then(async () => {
+        // imports a crash or restart cut off: roll back their half-saved data, mark them failed
+        const interrupted = await recoverInterruptedImports();
+        if (interrupted > 0) console.warn(`${interrupted} interrupted import(s) rolled back and marked failed`);
+    })
     .then(() => app.listen(PORT, () => console.log(`server on ${PORT}, mongo connected, indexes ready`)))
     .catch((err) => { console.error('server failed to start:', err.message); process.exit(1); });
 

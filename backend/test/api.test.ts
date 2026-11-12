@@ -134,7 +134,7 @@ describe('import (POST /api/import)', () => {
         assert.equal(run!.error, 'disk full');
         assert.equal(run!.file_name, 'events-test.json');
         assert.deepEqual(stored(), [`${run!.file_id}.json`]);                                 // a run points to this file, so it stays
-        assert.equal((await get('/api/quality')).body.last_import.status, 'failed');
+        assert.equal((await get('/api/quality')).body.last_failed.error, 'disk full');               // reported as the latest failure
     });
 
     test('the quality screen shows only the latest import', async () => {
@@ -303,7 +303,7 @@ describe('events list', () => {
 
 describe('quality', () => {
     test('before any import', async () => {
-        assert.deepEqual((await get('/api/quality')).body, { last_import: null, by_reason: [] });
+        assert.deepEqual((await get('/api/quality')).body, { last_import: null, last_failed: null, by_reason: [] });
         assert.deepEqual((await get('/api/quality/rejected')).body, { page: 1, limit: 20, total: 0, records: [] });
     });
 

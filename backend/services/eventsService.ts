@@ -85,22 +85,28 @@ const getLate = async (filters: EventFilters) => {
     };
 };
 
-// the last import, and how many of ITS rows were rejected for each reason
-// (file_id ?? null also matches rows saved before file_id existed)
+// the latest import that COMPLETED. A failed import is rolled back, so its rejected rows are gone:
+// the quality screen describes what is really in the database
+const lastCompleted = () => ImportRun.findOne({ status: 'completed' }).sort({ createdAt: -1 }).select('-_id -__v').lean();
+
+// the latest completed import and how many of ITS rows were rejected for each reason, plus a newer import that
+// failed (if any), so the screen can warn about it. (file_id ?? null also matches rows saved before file_id existed)
 const getQuality = async () => {
-    const last_import = await ImportRun.findOne().sort({ createdAt: -1 }).select('-_id -__v').lean();
+    const last_import = await lastCompleted();
+    const last_failed = await ImportRun.findOne({ status: 'failed', createdAt: { $gt: last_import?.createdAt ?? new Date(0) } })
+        .sort({ createdAt: -1 }).select('-_id -__v').lean();
     const rows = await RejectedRecord.aggregate([
         { $match: { file_id: last_import?.file_id ?? null } },
         { $group: { _id: '$reason', count: { $sum: 1 } } },
         { $sort: { count: -1, _id: 1 } },
     ]);
 
-    return { last_import, by_reason: rows.map((r) => ({ reason: r._id, count: r.count })) };
+    return { last_import, last_failed, by_reason: rows.map((r) => ({ reason: r._id, count: r.count })) };
 };
 
-// the rows the last import did not save, with the reason and the original row. reason narrows it down
+// the rows the latest completed import did not save, with the reason and the original row. reason narrows it down
 const getRejected = async (page: number, limit: number, reason?: string) => {
-    const last_import = await ImportRun.findOne().sort({ createdAt: -1 }).select('file_id').lean();
+    const last_import = await lastCompleted();
     const filter = { file_id: last_import?.file_id ?? null, ...(reason && { reason }) };
     const [total, records] = await Promise.all([
         RejectedRecord.countDocuments(filter),

@@ -115,39 +115,71 @@ const processChunk = async (rows: any[], start: number, file_id: string): Promis
     return { accepted: inserted.size, exact, conflicting, invalid };
 };
 
+// removes everything one import saved. Every event it inserted and every rejected row carries its file_id
+// (an event that was already saved keeps the file_id of the import that first saved it, so it is not touched).
+// ponytail: events have no index on file_id, so this scans the collection; fine because rollbacks are rare
+const rollBack = (file_id: string) => Promise.all([
+    Event.deleteMany({ file_id }),
+    RejectedRecord.deleteMany({ file_id }),
+]);
+
 // streams an uploaded file from disk (filePath), saves its new events chunk by chunk, keeps the rejected rows and records the run.
 // file_name is the name the user gave it, file_id is the one ID of this upload (it goes on everything saved).
-// Every import that starts leaves a run: completed, or failed with the error. On failure the error is thrown again:
-// a bad file is an AppError(400), anything else (the database) a 500, and the errorHandler turns it into the response.
-// Chunks saved before a failure stay saved (their events carry this file_id), and the failed run shows the counts so far
+// The run is created first ("running") and its counts are saved after every chunk, so the database always shows how far
+// an import got. Each file is all-or-nothing: if it fails, what it saved is rolled back and the run is marked failed.
+// The error is then thrown again: a bad file is an AppError(400), anything else a 500 (the errorHandler answers)
 const importEvents = async (filePath: string, file_name: string, file_id: string, chunkSize = CHUNK_SIZE) => {
     const start = Date.now();
     const totals: Counts = { accepted: 0, exact: 0, conflicting: 0, invalid: 0 };   // grows chunk by chunk
     let total_rows = 0;
+    // the counts so far, in the shape the run stores them
+    const counts = () => ({
+        total_rows, accepted: totals.accepted, exact_duplicates: totals.exact,
+        conflicting_duplicates: totals.conflicting, invalid: totals.invalid,
+    });
+
+    // the run exists from the start, so even a crash half way leaves a trace (see recoverInterruptedImports)
+    await ImportRun.create({ file_id, file_name, status: 'running' });
     try {
         for await (const chunk of readInChunks(filePath, chunkSize)) {
-            const counts = await processChunk(chunk.rows, chunk.start, file_id);
-            totals.accepted += counts.accepted;
-            totals.exact += counts.exact;
-            totals.conflicting += counts.conflicting;
-            totals.invalid += counts.invalid;
+            const chunkCounts = await processChunk(chunk.rows, chunk.start, file_id);
+            totals.accepted += chunkCounts.accepted;
+            totals.exact += chunkCounts.exact;
+            totals.conflicting += chunkCounts.conflicting;
+            totals.invalid += chunkCounts.invalid;
             total_rows += chunk.rows.length;
+            await ImportRun.updateOne({ file_id }, { $set: counts() });   // progress after every chunk
         }
 
-        const run = await ImportRun.create({
-            file_id, file_name, status: 'completed', total_rows, accepted: totals.accepted,
-            exact_duplicates: totals.exact, conflicting_duplicates: totals.conflicting, invalid: totals.invalid, duration_ms: Date.now() - start,
-        });
-        return { total_rows, accepted: totals.accepted, exact_duplicates: totals.exact, conflicting_duplicates: totals.conflicting, invalid: totals.invalid, run };
+        const run = await ImportRun.findOneAndUpdate(
+            { file_id },
+            { $set: { ...counts(), status: 'completed', duration_ms: Date.now() - start } },
+            { returnDocument: 'after' },   // answer with the run as it is now
+        );
+        return { ...counts(), run: run! };
     } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        await ImportRun.create({
-            file_id, file_name, status: 'failed', error: message, total_rows, accepted: totals.accepted,
-            exact_duplicates: totals.exact, conflicting_duplicates: totals.conflicting, invalid: totals.invalid, duration_ms: Date.now() - start,
+        await rollBack(file_id);
+        await ImportRun.updateOne({ file_id }, {
+            $set: { ...counts(), status: 'failed', error: message, rolled_back: true, duration_ms: Date.now() - start },
         });
-        console.error('import failed:', message);
+        console.error('import failed, rolled back:', message);
         throw e;
     }
 };
 
-export { importEvents, readInChunks };
+// A run still "running" when the server starts was cut off by a crash or a restart: no catch block ran for it.
+// Roll back what it saved and mark it failed, keeping its counts so far. Called once at startup (server.ts).
+// ponytail: assumes one server. With several, this would also cut another server's live import (needs a server id or heartbeat)
+const recoverInterruptedImports = async () => {
+    const runs = await ImportRun.find({ status: 'running' }).lean();
+    for (const run of runs) {
+        if (run.file_id) await rollBack(run.file_id);
+        await ImportRun.updateOne({ _id: run._id }, {
+            $set: { status: 'failed', error: 'interrupted: the server stopped during this import', rolled_back: true },
+        });
+    }
+    return runs.length;
+};
+
+export { importEvents, readInChunks, recoverInterruptedImports };

@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import Event from '../models/Event';
 import RejectedRecord from '../models/RejectedRecord';
 import ImportRun from '../models/ImportRun';
-import { importEvents, readInChunks } from '../services/importService';
+import { importEvents, readInChunks, recoverInterruptedImports } from '../services/importService';
 import * as eventsService from '../services/eventsService';
 import { AppError } from '../middleware/errorHandler';
 import { base, ev, seed, writeRows, useTestDb } from './helpers';
@@ -236,13 +236,14 @@ describe('when the import cannot finish', () => {
         assert.equal(await ImportRun.countDocuments({ status: 'failed' }), 3);
     });
 
-    test('a file that breaks in the middle: the chunks before the break stay saved, the run is failed with the message', async () => {
+    test('a file that breaks in the middle: what the first chunk saved is rolled back, the run is failed with the message', async () => {
         const id = randomUUID();
         const text = JSON.stringify([base, ev({ event_id: 'e2' }), ev({ event_id: 'e3' })]).slice(0, -20);   // cut off inside row 3
         await assert.rejects(importEvents(writeRows(text), 'events.json', id, 2), badFile(/^input file is not valid JSON: /));
-        assert.equal(await Event.countDocuments({ file_id: id }), 2);                                       // chunk 1 (rows 1-2) was saved
+        assert.equal(await Event.countDocuments({ file_id: id }), 0);                                       // chunk 1 was saved, then removed
         const saved = await ImportRun.findOne().lean();
-        assert.deepEqual({ status: saved!.status, accepted: saved!.accepted, total_rows: saved!.total_rows }, { status: 'failed', accepted: 2, total_rows: 2 });
+        assert.deepEqual({ status: saved!.status, rolled_back: saved!.rolled_back, accepted: saved!.accepted, total_rows: saved!.total_rows },
+            { status: 'failed', rolled_back: true, accepted: 2, total_rows: 2 });                          // the counts show how far it got
     });
 
     test('a file that cannot be read: the error is thrown and a failed run is saved', async () => {
@@ -357,20 +358,71 @@ describe('processing in chunks', () => {
         assert.equal(await RejectedRecord.countDocuments({ file_id: id }), 6);
     });
 
-    test('a failure in a later chunk: earlier chunks stay saved, and the failed run shows how far it got', async () => {
+    test('a failure in a later chunk: the earlier chunks are rolled back, and the failed run shows how far it got', async () => {
         const log = mock.method(console, 'error', () => {});
         const realWrite = Event.bulkWrite.bind(Event) as any;
         let calls = 0;
         const insert = mock.method(Event, 'bulkWrite', async (ops: any) => { if (++calls === 2) throw new Error('disk full'); return realWrite(ops); });
+        await seed([ev({ event_id: 'older', file_id: 'an-earlier-import' })]);                              // must survive the rollback
         const id = randomUUID();
         const six = [1, 2, 3, 4, 5, 6].map((n) => ev({ event_id: `e${n}` }));
         try {
             await assert.rejects(importEvents(writeRows(six), 'events-test.json', id, 2), /disk full/);      // 3 chunks of 2, the 2nd one fails
         } finally { insert.mock.restore(); log.mock.restore(); }
-        assert.equal(await Event.countDocuments({ file_id: id }), 2);                                         // only the 1st chunk was saved
-        const run = await ImportRun.findOne().lean();
-        assert.deepEqual({ status: run!.status, error: run!.error, accepted: run!.accepted, file_id: run!.file_id },
-            { status: 'failed', error: 'disk full', accepted: 2, file_id: id });
+        assert.equal(await Event.countDocuments({ file_id: id }), 0);                                         // chunk 1 was saved, then removed
+        assert.ok(await Event.exists({ event_id: 'older' }));                                                // another import's event is kept
+        const run = await ImportRun.findOne({ file_id: id }).lean();
+        assert.deepEqual({ status: run!.status, error: run!.error, rolled_back: run!.rolled_back, accepted: run!.accepted },
+            { status: 'failed', error: 'disk full', rolled_back: true, accepted: 2 });
+    });
+
+});
+
+describe('progress and crash recovery', () => {
+    test('during an import the run is "running" and its counts grow after every chunk', async () => {
+        const realWrite = Event.bulkWrite.bind(Event) as any;
+        const seen: unknown[] = [];
+        const insert = mock.method(Event, 'bulkWrite', async (ops: any) => {
+            const now = await ImportRun.findOne().lean();                                                    // what the DB shows at this moment
+            seen.push([now!.status, now!.total_rows]);
+            return realWrite(ops);
+        });
+        try {
+            await importEvents(writeRows([base, ev({ event_id: 'e2' }), ev({ event_id: 'e3' })]), 'events.json', randomUUID(), 1);
+        } finally { insert.mock.restore(); }
+        assert.deepEqual(seen, [['running', 0], ['running', 1], ['running', 2]]);                         // seen while chunks 1, 2, 3 were saved
+        assert.equal((await ImportRun.findOne().lean())!.status, 'completed');
+    });
+
+    test('after a crash: the run left "running" is rolled back and marked failed at the next start', async () => {
+        // what a crash after 2 saved rows leaves behind: a "running" run, its events and its rejected rows
+        await ImportRun.create({ file_id: 'cut-off', file_name: 'oct.json', status: 'running', total_rows: 3, accepted: 2, invalid: 1 });
+        await seed([ev({ event_id: 'e1', file_id: 'cut-off' }), ev({ event_id: 'e2', file_id: 'cut-off' }), ev({ event_id: 'e9', file_id: 'other' })]);
+        await RejectedRecord.create({ file_id: 'cut-off', row_number: 3, reason: 'MISSING_EVENT_ID', raw: {} });
+
+        assert.equal(await recoverInterruptedImports(), 1);
+
+        assert.deepEqual((await Event.find().lean()).map((e) => e.event_id), ['e9']);                      // only the other import's event is left
+        assert.equal(await RejectedRecord.countDocuments(), 0);
+        const run = await ImportRun.findOne({ file_id: 'cut-off' }).lean();
+        assert.deepEqual({ status: run!.status, rolled_back: run!.rolled_back, total_rows: run!.total_rows, error: run!.error },
+            { status: 'failed', rolled_back: true, total_rows: 3, error: 'interrupted: the server stopped during this import' });
+    });
+
+    test('a retry after a failure gives the same counts as a first import (nothing left over)', async () => {
+        const rows = [base, ev({ event_id: 'e2' }), base, ev({ event_id: '' }), ev({ event_id: 'e3' }), ev({ event_id: 'e2', segment: 'Used' })];
+        const log = mock.method(console, 'error', () => {});
+        const realWrite = Event.bulkWrite.bind(Event) as any;
+        let calls = 0;
+        const insert = mock.method(Event, 'bulkWrite', async (ops: any) => { if (++calls === 2) throw new Error('disk full'); return realWrite(ops); });
+        try {
+            // chunks of 2: chunk 1 writes, chunk 2 has no new event (no write), the write of chunk 3 fails
+            await assert.rejects(importEvents(writeRows(rows), 'oct.json', randomUUID(), 2), /disk full/);
+        } finally { insert.mock.restore(); log.mock.restore(); }
+
+        const retry = await run(rows);
+        assert.deepEqual(counts(retry), { total_rows: 6, accepted: 3, exact: 1, conflicting: 1, invalid: 1 });   // the file's real numbers
+        assert.equal(await RejectedRecord.countDocuments(), 3);                                                 // only the retry's rejected rows
     });
 });
 
