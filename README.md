@@ -118,8 +118,15 @@ frontend/
 
 ### Indexes and what uses them
 
-The indexes are declared next to the schema in `models/Event.ts`, and Mongoose creates them when the
-app starts. There is no separate migration step.
+The indexes are declared next to the schemas in `models/`, and Mongoose creates them when the app starts.
+The server waits for them before it takes requests (`server.ts`), so no import ever runs without the unique
+index on `event_id`, and it stops with the reason if one cannot be built (for example duplicates already in the
+collection). After that, MongoDB updates every index on each insert by itself; nothing in the code maintains them.
+Dropping a collection drops its indexes too, so after clearing the database by hand, restart the server
+(`rs` in nodemon). Without them every `event_id` lookup scans the whole collection: four 10k-row files took
+8 s, 23 s, 40 s and 54 s instead of about 0.8 s each. In production I would turn `autoIndex` off and create
+the indexes in a migration at deploy time. There is no TTL (auto-expiry) index: events are the canonical data
+and must not expire; rejected rows could get one once the business decides how long to keep them.
 
 - `event_id`, unique. This is what makes a second import safe, and it is the last line of defence
   against a duplicate.
